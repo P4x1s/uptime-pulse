@@ -10,8 +10,10 @@
  *   PROBE_ID      必填，例如 cn-sh-1（需与监控项中的探针 ID 一致）
  *   PROBE_REGION  可选，展示用，默认同 PROBE_ID
  *   INTERVAL_SEC  可选，默认 60，最小 30
+ *
+ * 判定逻辑与 Worker 保持一致：多期望状态码 + 响应关键字正反匹配 + 瞬时故障重试。
  */
-import { isPrivateIp } from '../../src/demo.mjs';
+import { isPrivateIp, errorClass } from '../../src/demo.mjs';
 
 const WORKER_URL = process.env.WORKER_URL || '';
 const PROBE_TOKEN = process.env.PROBE_TOKEN || '';
@@ -38,37 +40,95 @@ function assertSafeUrl(raw) {
   return u;
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 async function fetchJson(url, init = {}) {
   const resp = await fetch(url, init);
   if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${url}`);
   return resp.json();
 }
 
+/** 受大小限制读取响应文本（关键字校验用） */
+async function readBodyCapped(resp, cap = 65536) {
+  if (!resp || !resp.body) return '';
+  const reader = resp.body.getReader ? resp.body.getReader() : null;
+  if (!reader) return (await resp.text()).slice(0, cap);
+  const decoder = new TextDecoder();
+  let out = '', received = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = value.length > cap - received ? value.subarray(0, Math.max(0, cap - received)) : value;
+      if (chunk.length) { out += decoder.decode(chunk, { stream: true }); received += chunk.length; }
+      if (received >= cap) break;
+    }
+    out += decoder.decode();
+  } catch { /* 保留已读内容 */ }
+  try { await reader.cancel().catch(() => {}); } catch { /* noop */ }
+  return out;
+}
+
+function expectedCodes(task) {
+  if (Array.isArray(task.expectedCodes) && task.expectedCodes.length) return task.expectedCodes;
+  return [task.expectedStatus || 200];
+}
+
+function retryable(cls) {
+  return cls === 'timeout' || cls === 'dns' || cls === 'tls' || cls === 'network';
+}
+
+async function attempt(task, target) {
+  const started = Date.now();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.min(30000, task.timeoutMs || 5000));
+  const headers = { 'user-agent': `UptimePulseProbe/2.0 (${PROBE_ID})`, ...(task.headers || {}) };
+  const init = { method: task.method === 'HEAD' ? 'HEAD' : 'GET', redirect: 'manual', signal: controller.signal, headers };
+  if (task.body && init.method !== 'GET' && init.method !== 'HEAD') init.body = task.body;
+  let resp;
+  try {
+    resp = await fetch(target.toString(), init);
+  } finally { clearTimeout(timer); }
+  const status = resp.status;
+  const needBody = !!(task.responseKeyword || task.responseForbiddenKeyword);
+  if (needBody) {
+    const body = await readBodyCapped(resp);
+    const codes = expectedCodes(task);
+    let error = null;
+    if (!codes.includes(status)) error = `HTTP ${status}`;
+    else if (task.responseKeyword && !body.includes(task.responseKeyword)) error = 'keyword-missing';
+    else if (task.responseForbiddenKeyword && body.includes(task.responseForbiddenKeyword)) error = 'keyword-forbidden';
+    return { status, error, latencyMs: Date.now() - started };
+  }
+  if (resp.body) await resp.body.cancel().catch(() => {});
+  const codes = expectedCodes(task);
+  return { status, error: codes.includes(status) ? null : `HTTP ${status}`, latencyMs: Date.now() - started };
+}
+
 async function probeOne(task) {
   const started = Date.now();
-  let status = 0, ok = false, error = null;
+  let last = { status: 0, error: 'unknown' }, used = 0;
   try {
     const target = assertSafeUrl(task.url);
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), Math.min(30000, task.timeoutMs || 5000));
-    let resp;
-    try {
-      resp = await fetch(target.toString(), {
-        method: task.method === 'HEAD' ? 'HEAD' : 'GET',
-        redirect: 'manual',
-        signal: controller.signal,
-        headers: { 'user-agent': `UptimePulseProbe/1.0 (${PROBE_ID})` },
-      });
-    } finally { clearTimeout(timer); }
-    status = resp.status;
-    ok = status === (task.expectedStatus || 200);
-    if (resp.body) await resp.body.cancel().catch(() => {});
+    const maxAttempts = 1 + Math.max(0, Math.min(3, Number(task.retries) || 0));
+    for (let i = 1; i <= maxAttempts; i++) {
+      try {
+        last = await attempt(task, target);
+      } catch (e) {
+        last = { status: 0, error: e && e.name === 'AbortError' ? 'timeout' : String((e && e.message) || e).slice(0, 200) };
+      }
+      used = i;
+      if (!last.error || !retryable(errorClass(last.error)) || i >= maxAttempts) break;
+      await sleep(Math.min(400, 120 * (2 ** (i - 1))));
+    }
   } catch (e) {
-    error = e && e.name === 'AbortError' ? 'timeout' : String((e && e.message) || e).slice(0, 200);
+    last = { status: 0, error: String((e && e.message) || e).slice(0, 200) };
+    used = 1;
   }
   return {
     monitorId: task.id, probeId: PROBE_ID, region: PROBE_REGION,
-    ok, status, latencyMs: Date.now() - started, error,
+    ok: !last.error, status: last.status, latencyMs: Date.now() - started,
+    error: last.error, errorClass: last.error ? errorClass(last.error) : 'ok', attempts: used,
   };
 }
 

@@ -4,7 +4,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createWorker, runDueChecks } from '../src/index.mjs';
-import { dashboardHtml, APP_CSS, APP_JS } from '../src/demo.mjs';
+import { dashboardHtml, APP_CSS, APP_JS, probeOnce, errorClass, windowUptime } from '../src/demo.mjs';
 import { MONITORS, resolveAlertConfig, buildWebhookBody } from '../src/config.mjs';
 
 class MockKV {
@@ -138,11 +138,12 @@ test('UI 静态特征：浅色主题、顶部徽章与系统正常、分组卡�
   for (const s of ['系统一切正常', '最后更新于', 'id="heroIcon"', 'id="groups"', '只读状态面板']) {
     assert.ok(page.includes(s), `页面缺少 ${s}`);
   }
-  assert.ok(APP_CSS.includes('background:#fff'), '应为浅色背景');
+  assert.ok(APP_CSS.includes('--bg:#fff') || APP_CSS.includes('background:#fff'), '应默认浅色背景');
   assert.ok(APP_CSS.includes('#22c55e'), '应有绿色状态条');
   assert.ok(APP_CSS.includes('.spark'), '应有折线图样式');
-  assert.ok(!APP_CSS.includes('#0f1115'), '不应残留深色主题');
-  for (const s of ['响应时间(ms)', '在线', '总可用率', 'createElementNS', 'polyline', 'addEventListener', 'textContent']) {
+  assert.ok(APP_CSS.includes('prefers-color-scheme') || APP_CSS.includes('data-theme'), '应支持主题切换');
+  assert.ok(!APP_CSS.includes('#0f1115'), '不应残留旧深色主题');
+  for (const s of ['响应时间(ms)', '在线', '总可用率', '24h', 'createElementNS', 'polyline', 'addEventListener', 'textContent']) {
     assert.ok(APP_JS.includes(s), `前端脚本缺少 ${s}`);
   }
   assert.ok(!APP_JS.includes('innerHTML'), '禁止 innerHTML');
@@ -324,4 +325,153 @@ test('生产 Worker 未注入 resolveDns 时 Webhook 仍走默认 DoH 并成功�
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+// ---------- 整体升级：增强检测引擎（多状态码 / 关键字 / 自定义请求 / 重试 / 错误分类） ----------
+test('多期望状态码：expectedCodes 优先，任一命中即判正常', async () => {
+  const ctx = makeEnv();
+  ctx.env.fetchImpl = async () => new Response('', { status: 201 });
+  const m = target({ expectedStatus: 200, expectedCodes: [200, 201] });
+  const r = await probeOnce(m, ctx.env);
+  assert.equal(r.ok, true, '201 属于期望集合应判正常');
+  assert.equal(r.status, 201);
+  ctx.env.fetchImpl = async () => new Response('', { status: 302 });
+  const r2 = await probeOnce(m, ctx.env);
+  assert.equal(r2.ok, false, '非期望状态码应判故障');
+  assert.equal(r2.errorClass, 'status');
+});
+
+test('响应关键字正反匹配：缺失必需关键字或出现禁用关键字均判故障', async () => {
+  const ctx = makeEnv();
+  ctx.env.fetchImpl = async () => new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
+  const good = await probeOnce(target({ responseKeyword: '"status":"ok"' }), ctx.env);
+  assert.equal(good.ok, true, '含必需关键字应正常');
+  const missing = await probeOnce(target({ responseKeyword: 'healthy' }), ctx.env);
+  assert.equal(missing.ok, false);
+  assert.equal(missing.errorClass, 'keyword');
+  ctx.env.fetchImpl = async () => new Response('bad gateway upstream', { status: 200 });
+  const forbidden = await probeOnce(target({ responseForbiddenKeyword: 'bad gateway' }), ctx.env);
+  assert.equal(forbidden.ok, false, '出现禁用关键字应判故障');
+  assert.equal(forbidden.errorClass, 'keyword');
+});
+
+test('自定义请求方法/头/体：探测时按配置发出', async () => {
+  const ctx = makeEnv();
+  let seen = null;
+  ctx.env.fetchImpl = async (url, init = {}) => {
+    if (String(url).includes('a.example.com')) { seen = init; return new Response('', { status: 200 }); }
+    return new Response('', { status: 200 });
+  };
+  await probeOnce(target({ method: 'POST', headers: { 'X-Api-Key': 'k123' }, body: '{"ping":1}' }), ctx.env);
+  assert.ok(seen, '应发起探测');
+  assert.equal(seen.method, 'POST');
+  assert.equal(seen.headers['X-Api-Key'], 'k123');
+  assert.equal(seen.body, '{"ping":1}');
+  assert.equal(seen.redirect, 'manual', '仍禁止跟随重定向');
+});
+
+test('瞬时故障重试：超时后重试成功即判正常并记录尝试次数', async () => {
+  const ctx = makeEnv();
+  let n = 0;
+  ctx.env.fetchImpl = async () => {
+    n += 1;
+    if (n < 3) { const e = new Error('aborted'); e.name = 'AbortError'; throw e; }
+    return new Response('', { status: 200 });
+  };
+  const r = await probeOnce(target({ retries: 2 }), ctx.env);
+  assert.equal(r.ok, true, '重试后成功应判正常');
+  assert.equal(r.attempts, 3, '应记录实际尝试次数');
+  assert.equal(n, 3);
+});
+
+test('确定性故障不重试：状态码不匹配只探测一次', async () => {
+  const ctx = makeEnv();
+  let n = 0;
+  ctx.env.fetchImpl = async () => { n += 1; return new Response('', { status: 500 }); };
+  const r = await probeOnce(target({ retries: 3 }), ctx.env);
+  assert.equal(r.ok, false);
+  assert.equal(n, 1, 'HTTP 500 不应触发重试');
+  assert.equal(r.errorClass, 'status');
+});
+
+test('错误分类稳定：timeout/status/keyword/dns/tls/network', () => {
+  assert.equal(errorClass('timeout'), 'timeout');
+  assert.equal(errorClass('HTTP 503'), 'status');
+  assert.equal(errorClass('keyword-missing'), 'keyword');
+  assert.equal(errorClass('getaddrinfo ENOTFOUND x'), 'dns');
+  assert.equal(errorClass('TLS handshake failed'), 'tls');
+  assert.equal(errorClass('fetch failed'), 'network');
+  assert.equal(errorClass(null), 'ok');
+});
+
+// ---------- 整体升级：状态接口新字段（24h 可用率 / 当前延迟 / 事件历史 / 摘要） ----------
+test('状态接口返回 24h 可用率、当前延迟、错误分类、事件历史与摘要', async () => {
+  const ctx = makeEnv({ MONITORS: [target({ failureThreshold: 1 })], ALERT_FAILURE_THRESHOLD: '1' });
+  ctx.env.fetchImpl = async (url) => {
+    if (String(url).includes('alert.example.com')) return new Response('', { status: 200 });
+    return new Response('', { status: 500 });
+  };
+  await runDueChecks(ctx.env, true); // 故障 -> firing，写入事件
+  const data = await (await ctx.worker.fetch(new Request('http://localhost/api/status'))).json();
+  const m = data.monitors[0];
+  assert.equal(m.state, 'firing');
+  assert.equal(m.latencyMs, 0);
+  assert.equal(typeof m.uptime24h, 'number', '应返回 24h 可用率');
+  assert.equal(typeof m.uptime, 'number');
+  assert.ok(m.errorClass, '应有错误分类');
+  assert.ok(Array.isArray(data.events) && data.events.length >= 1, '应有故障事件记录');
+  assert.equal(data.events[0].resolved, false);
+  assert.equal(data.summary.total, 1);
+  assert.equal(data.summary.offline, 1);
+
+  ctx.env.fetchImpl = async () => new Response('', { status: 200 });
+  await runDueChecks(ctx.env, true); // 恢复
+  const data2 = await (await ctx.worker.fetch(new Request('http://localhost/api/status'))).json();
+  assert.equal(data2.monitors[0].state, 'ok');
+  assert.ok(data2.events[0].resolved === true, '恢复后事件应标记为已恢复');
+  assert.ok(data2.events[0].durationMs >= 0);
+});
+
+test('windowUptime 按时间窗口计算可用率', () => {
+  const now = Date.now();
+  const hist = [
+    { checkedAt: new Date(now - 1000).toISOString(), ok: true },
+    { checkedAt: new Date(now - 2000).toISOString(), ok: false },
+    { checkedAt: new Date(now - 10 * 86400000).toISOString(), ok: false },
+  ];
+  const day = windowUptime(hist, now - 86400000);
+  assert.equal(day.samples, 2, '仅统计 24h 内样本');
+  assert.equal(day.uptime, 0.5);
+  const all = windowUptime(hist, 0);
+  assert.equal(all.samples, 3);
+  assert.ok(Math.abs(all.uptime - 1 / 3) < 1e-9);
+  assert.equal(windowUptime([], now - 86400000).uptime, 1, '无样本按未被证明故障处理');
+});
+
+test('配置规范化：new 字段被安全钳制（expectedCodes/retries/headers/body/关键字）', async () => {
+  let seen = null;
+  const ctx = makeEnv({
+    MONITORS: [target({
+      method: 'POST', expectedCodes: [200, 999, 201, 201], retries: 0,
+      headers: { 'X-Ok': 'v', host: 'evil.com', 'X-Num': 123 },
+      body: 'x'.repeat(10000),
+      hideLatencyChart: true, statusPageLink: 'javascript:alert(1)',
+    })],
+  });
+  ctx.env.fetchImpl = async (url, init = {}) => {
+    if (String(url).includes('a.example.com')) { seen = init; return new Response('ok', { status: 201 }); }
+    return new Response('', { status: 200 });
+  };
+  await runDueChecks(ctx.env, true); // 走真实路径：normalizeTarget -> probeOnce
+  const data = await (await ctx.worker.fetch(new Request('http://localhost/api/status'))).json();
+  assert.equal(data.monitors.length, 1);
+  assert.equal(data.monitors[0].state, 'ok', '201 在 expectedCodes 内应正常');
+  assert.equal(data.monitors[0].hideLatencyChart, true);
+  assert.equal(data.monitors[0].statusPageLink, '', 'javascript: 链接应被过滤');
+  assert.ok(seen, '应发起探测');
+  assert.ok(!seen.headers.host, '危险头 Host 应被过滤');
+  assert.ok(!seen.headers['content-length'], '逐跳头应被过滤');
+  assert.equal(seen.headers['X-Ok'], 'v');
+  assert.equal(seen.headers['X-Num'], '123', '数字头值应转字符串');
+  assert.ok(seen.body.length <= 4096, '请求体应被截断到 4096');
 });

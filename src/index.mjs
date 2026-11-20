@@ -5,11 +5,14 @@
  * 告警通知地址与开关来自环境变量（ALERT_*），不在代码中写死。
  * 前端只读展示；不提供任何修改监控配置的接口或入口。
  * 保留：多线路聚合、国内探针回传、邮件 + Webhook 双通道、历史与异常查询。
- * 安全原语与状态接口复用 src/demo.mjs，避免两套实现产生分歧。
+ * 安全原语、检测引擎、状态接口与 UI 复用 src/demo.mjs，避免两套实现产生分歧。
+ *
+ * 升级要点（参考 UptimeFlare）：多期望状态码 / 关键字校验 / 自定义请求 / 重试由
+ * probeOnce 统一处理；生产版叠加多线路聚合、故障事件记录与瞬时故障判定。
  */
 import {
-  assertPublicTarget, safeEqual, hmacSign, probeOnce, getJson, dohResolve,
-  getMonitors, clampInt, dashboardHtml, APP_CSS, APP_JS, getStatusPayload,
+  assertPublicTarget, safeEqual, hmacSign, probeOnce, getJson, dohResolve, clampInt,
+  getMonitors, dashboardHtml, APP_CSS, APP_JS, getStatusPayload, errorClass, recordEvent,
 } from './demo.mjs';
 import { resolveAlertConfig, buildWebhookBody } from './config.mjs';
 
@@ -43,7 +46,7 @@ async function sendWebhook(url, payload, env) {
   // 标准 Webhook（含 ntfy 原生端点）继续接收完整 JSON 告警 payload。
   const built = buildWebhookBody(url, payload);
   const body = JSON.stringify(built.body);
-  const headers = { 'user-agent': 'UptimePulse/1.0 (+alert)' };
+  const headers = { 'user-agent': 'UptimePulse/2.0 (+alert)' };
   if (env.ALERT_SIGNING_SECRET) headers['x-uptimepulse-signature'] = `sha256=${await hmacSign(body, env.ALERT_SIGNING_SECRET)}`;
   await postJson(env, target.toString(), body, headers);
 }
@@ -57,9 +60,10 @@ async function sendEmail(to, payload, env) {
     `类型: ${payload.type === 'firing' ? '故障' : '恢复'}`,
     `监控项: ${payload.monitor.name || payload.monitor.id}`,
     `目标: ${payload.monitor.url}`,
-    `线路: ${payload.result.region}`,
+    `线路: ${payload.result.region || 'edge'}`,
     `HTTP: ${payload.result.status}`,
     `耗时: ${payload.result.latencyMs}ms`,
+    `错误类别: ${payload.result.errorClass || '-'}`,
     `时间: ${payload.timestamp}`,
     `连续失败: ${payload.state.consecutiveFailures}`,
     payload.result.error ? `错误: ${payload.result.error}` : '',
@@ -70,13 +74,13 @@ async function sendEmail(to, payload, env) {
 }
 
 /** 告警地址与开关来自 env（ALERT_*）；监控项可选覆盖，但 alertEnabled:false 可整体关闭该项告警 */
-async function dispatchAlerts(monitor, type, record, state, env) {
+async function dispatchAlerts(monitor, type, aggregated, state, env) {
   if (monitor.alertEnabled === false) return;
   const cfg = resolveAlertConfig(env);
   const payload = {
     type,
     monitor: { id: monitor.id, name: monitor.name, url: monitor.url },
-    result: record,
+    result: aggregated,
     state,
     timestamp: new Date().toISOString(),
   };
@@ -94,52 +98,71 @@ async function dispatchAlerts(monitor, type, record, state, env) {
 
 // ---------- 状态机与聚合 ----------
 function aggregateResults(results, mode) {
-  if (!results.length) return { ok: false, status: 0, latencyMs: 0, error: 'no-probe-data' };
+  if (!results.length) return { ok: false, status: 0, latencyMs: 0, error: 'no-probe-data', errorClass: 'probe-missing' };
   const ok = mode === 'all' ? results.every((r) => r.ok) : results.some((r) => r.ok);
   const primary = results.find((r) => r.ok) || results[0];
+  const failed = results.filter((r) => !r.ok);
+  const error = ok ? null : (primary.error || `HTTP ${primary.status}`);
+  const errorClassValue = ok ? 'ok' : (failed.find((r) => r.errorClass && r.errorClass !== 'ok')?.errorClass || errorClass(error));
   return {
     ok,
     status: primary.status,
     latencyMs: Math.max(...results.map((r) => r.latencyMs || 0)),
-    error: ok ? null : (primary.error || `HTTP ${primary.status}`),
+    error,
+    errorClass: errorClassValue,
+    attempts: Math.max(...results.map((r) => Number(r.attempts) || 0)),
   };
-}
-
-/** 将动态错误文本归一化为稳定类别，避免错误文案变化导致去重失效（告警风暴） */
-function errorClass(error) {
-  if (!error) return 'http';
-  const e = String(error).toLowerCase();
-  if (e.includes('timeout') || e.includes('abort')) return 'timeout';
-  if (e.includes('no-probe-data') || e.includes('stale') || e.includes('probe-missing')) return 'probe-missing';
-  if (e.includes('dns') || e.includes('resolve') || e.includes('enotfound')) return 'dns';
-  if (e.includes('tls') || e.includes('certificate') || e.includes('ssl')) return 'tls';
-  return 'network';
 }
 
 async function applyIncident(monitor, aggregated, env) {
   const key = `incident:${monitor.id}`;
   let state = await getJson(env.KV, key, {
     state: 'ok', consecutiveFailures: 0, incidentId: null, lastAlertAt: 0, lastSignature: null,
+    totalChecks: 0, upChecks: 0, downChecks: 0, outageStart: 0,
   });
+  state.totalChecks = Number(state.totalChecks) || 0;
+  state.upChecks = Number(state.upChecks) || 0;
+  state.downChecks = Number(state.downChecks) || 0;
+  state.outageStart = Number(state.outageStart) || 0;
   // Workers 变量 ALERT_FAILURE_THRESHOLD 优先；未设置时沿用监控项自身阈值（默认 3）
   const alertCfg = resolveAlertConfig(env);
   const threshold = alertCfg.failureThreshold ?? Math.max(1, monitor.failureThreshold || 3);
   const cooldownMs = Math.max(0, monitor.alertCooldownSec ?? 300) * 1000;
+  const now = Date.now();
+  state.totalChecks += 1;
 
   if (aggregated.ok) {
     const wasFiring = state.state === 'firing';
-    state = { state: 'ok', consecutiveFailures: 0, incidentId: null, lastAlertAt: 0, lastSignature: null };
-    if (wasFiring) await dispatchAlerts(monitor, 'recovered', aggregated, state, env);
+    state.upChecks += 1;
+    const outageStart = state.outageStart;
+    state = { ...state, state: 'ok', consecutiveFailures: 0, incidentId: null,
+      lastAlertAt: 0, lastSignature: null, outageStart: 0 };
+    if (wasFiring) {
+      try {
+        await recordEvent(env, monitor.id, {
+          start: outageStart || now, end: now, durationMs: Math.max(0, now - (outageStart || now)),
+          errorClass: aggregated.errorClass || 'unknown', resolved: true,
+        });
+      } catch (e) { console.error('记录恢复事件失败', e); }
+      await dispatchAlerts(monitor, 'recovered', aggregated, state, env);
+    }
   } else {
+    state.downChecks += 1;
     state.consecutiveFailures += 1;
     if (state.consecutiveFailures >= threshold) {
       if (state.state !== 'firing') {
         state.state = 'firing';
         state.incidentId = crypto.randomUUID();
+        state.outageStart = now;
+        try {
+          await recordEvent(env, monitor.id, {
+            start: now, end: null, durationMs: 0, errorClass: aggregated.errorClass || 'unknown', resolved: false,
+          });
+        } catch (e) { console.error('记录故障事件失败', e); }
       }
-      const signature = `${aggregated.status}:${errorClass(aggregated.error)}`;
-      const now = Date.now();
-      if (signature !== state.lastSignature || now - state.lastAlertAt >= cooldownMs) {
+      const signature = `${aggregated.status}:${aggregated.errorClass || errorClass(aggregated.error)}`;
+      const shouldNotify = signature !== state.lastSignature || now - state.lastAlertAt >= cooldownMs;
+      if (shouldNotify) {
         await dispatchAlerts(monitor, 'firing', aggregated, state, env);
         state.lastAlertAt = now;
         state.lastSignature = signature;
@@ -154,7 +177,7 @@ async function commitRound(monitor, results, env) {
   const aggregated = aggregateResults(results, monitor.aggregate);
   const state = await applyIncident(monitor, aggregated, env);
   const history = await getJson(env.KV, `history:${monitor.id}`, []);
-  history.unshift({ checkedAt: new Date().toISOString(), results, ...aggregated, incidentState: state.state });
+  history.unshift({ checkedAt: new Date().toISOString(), ...aggregated, results, incidentState: state.state });
   if (history.length > MAX_HISTORY) history.length = MAX_HISTORY;
   await env.KV.put(`history:${monitor.id}`, JSON.stringify(history));
   await env.KV.put(`lastrun:${monitor.id}`, Date.now());
@@ -165,12 +188,13 @@ async function commitRound(monitor, results, env) {
 async function runDueChecks(env, force = false) {
   const monitors = await getMonitors(env);
   const now = Date.now();
-  const output = [];
-  for (const m of monitors) {
-    if (!m.enabled) continue;
-    const intervalMs = Math.max(60, m.intervalSec || 60) * 1000;
-    const lastRun = Number(await getJson(env.KV, `lastrun:${m.id}`, 0)) || 0;
-    if (!force && now - lastRun < intervalMs) continue;
+  const candidates = monitors.filter((m) => m.enabled).map((m) => ({
+    m, intervalMs: Math.max(60, m.intervalSec || 60) * 1000,
+  }));
+  const lastRuns = await Promise.all(candidates.map(({ m }) => getJson(env.KV, `lastrun:${m.id}`, 0)));
+  const due = candidates.filter(({ m, intervalMs }, i) => force || now - (Number(lastRuns[i]) || 0) >= intervalMs).map(({ m }) => m);
+
+  return Promise.all(due.map(async (m) => {
     const results = [];
     for (const probe of m.probes || []) {
       if (probe.type === 'edge') {
@@ -178,16 +202,19 @@ async function runDueChecks(env, force = false) {
       } else {
         const report = await getJson(env.KV, `probe:${m.id}:${probe.id}`, null);
         const freshMs = Math.max(120, m.intervalSec * 3) * 1000;
-        if (report && now - report.receivedAt <= freshMs) results.push(report);
-        else results.push({
-          probeId: probe.id, region: probe.region, ok: false, status: 0,
-          latencyMs: 0, error: 'probe-stale', checkedAt: new Date().toISOString(),
-        });
+        if (report && now - report.receivedAt <= freshMs) {
+          results.push({ ...report, errorClass: report.errorClass || errorClass(report.error), attempts: report.attempts || 1 });
+        } else {
+          results.push({
+            probeId: probe.id, region: probe.region, ok: false, status: 0,
+            latencyMs: 0, error: 'probe-stale', errorClass: 'probe-missing', attempts: 0,
+            checkedAt: new Date().toISOString(),
+          });
+        }
       }
     }
-    output.push({ id: m.id, ...(await commitRound(m, results, env)) });
-  }
-  return output;
+    return { id: m.id, ...(await commitRound(m, results, env)) };
+  }));
 }
 
 // ---------- 鉴权（仅探针回传仍需令牌；配置接口已移除） ----------
@@ -218,7 +245,7 @@ export function createWorker(env) {
       return json({ error: '只读模式：监控目标由服务端配置统一管理，不支持修改' }, 405);
     }
 
-    // 探针任务：仅返回分配给该探针的非敏感字段
+    // 探针任务：仅返回分配给该探针的非敏感字段；附带新检测参数供探针侧一致判定
     if (path === '/api/probes/tasks' && method === 'GET') {
       if (!isProbe(request, env)) return json({ error: '未授权' }, 401);
       const probeId = url.searchParams.get('probeId') || '';
@@ -226,7 +253,9 @@ export function createWorker(env) {
       const tasks = monitors.filter((m) => m.enabled && (m.probes || []).some((p) => p.id === probeId && p.type === 'external'))
         .map((m) => ({
           id: m.id, url: m.url, method: m.method, expectedStatus: m.expectedStatus,
-          timeoutMs: m.timeoutMs, intervalSec: m.intervalSec, probeId,
+          expectedCodes: m.expectedCodes, headers: m.headers, body: m.body,
+          responseKeyword: m.responseKeyword, responseForbiddenKeyword: m.responseForbiddenKeyword,
+          retries: m.retries, timeoutMs: m.timeoutMs, intervalSec: m.intervalSec, probeId,
         }));
       return json({ tasks, serverTime: Date.now() });
     }
@@ -243,13 +272,16 @@ export function createWorker(env) {
       if (!monitor || !(monitor.probes || []).some((p) => p.id === probeId && p.type === 'external')) {
         return json({ error: '未知监控项或探针' }, 404);
       }
+      const rawError = typeof body.error === 'string' ? body.error.slice(0, 200) : null;
       const report = {
         probeId,
         region: String(body.region || probeId).slice(0, 40),
         ok: body.ok === true,
         status: clampInt(body.status, 0, 599, 0),
         latencyMs: clampInt(body.latencyMs, 0, 300000, 0),
-        error: typeof body.error === 'string' ? body.error.slice(0, 200) : null,
+        error: rawError,
+        errorClass: body.ok === true ? 'ok' : (typeof body.errorClass === 'string' ? body.errorClass.slice(0, 32) : errorClass(rawError)),
+        attempts: clampInt(body.attempts, 0, 5, 1),
         checkedAt: new Date().toISOString(),
         receivedAt: Date.now(),
       };

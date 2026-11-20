@@ -7,10 +7,18 @@
 ## 特性
 
 - 代码内集中配置：一个数组管理所有网站与服务，支持名称、地址、类型、启用状态与检测参数
-- 目标独立检测：每个监控项独立调度、独立历史、独立告警状态机
-- 多线路检测：Cloudflare 边缘线路（国外）+ 自托管探针（国内）
-- 检测维度：HTTP 状态、响应时间、超时、连续失败
-- 状态页：按截图的浅色风格，顶部徽章 + 分组卡片 + 历史状态条 + 响应时间折线图 + 总可用率
+- 目标独立检测：每个监控项独立调度、独立历史、独立告警状态机；到期项并行探测，缩短 Cron 耗时
+- 多线路检测：Cloudflare 边缘线路（国外）+ 自托管探针（国内），判定规则两端一致
+- 检测维度（参考 UptimeFlare 设计）：
+  - 多期望状态码 `expectedCodes`（任一命中即正常，优先于 `expectedStatus`）
+  - 响应体关键字正反匹配 `responseKeyword` / `responseForbiddenKeyword`（只读前 64KB）
+  - 自定义请求方法与头/体（POST/PUT/...、`headers`、`body`，自动过滤危险逐跳头）
+  - 瞬时故障重试 `retries`（超时/DNS/TLS/网络类，指数退避；确定性状态码故障不重试）
+  - 稳定错误分类（status / keyword / timeout / dns / tls / network），避免告警风暴
+- 状态记录：累计 up/down 计数 + 故障事件历史（起止时间、持续时长、原因、恢复状态）
+- 状态页：顶部徽章 + 统计摘要（在线数/24h 可用率）+ 分组卡片 + 状态条 + 响应时间折线图
+  - 时间区间切换（24 小时 / 7 天 / 全部）、当前延迟、连续失败、工具提示
+  - 浅色/深色主题（跟随系统 + 手动切换并记忆）、响应式布局、手动刷新、无障碍标签
 - 告警：Webhook（HMAC 签名）、邮件（Resend），地址与开关均可配置，含恢复通知、失败阈值、冷却去重
 - 安全：仅探针回传保留令牌、SSRF 防护、严格 CSP、零 `innerHTML` 用户渲染、写接口全部禁用
 
@@ -22,7 +30,7 @@ src/demo.mjs           核心库（SSRF/检测/告警）+ 截图风格只读页�
 src/index.mjs          完整版 Worker（多线路 + 邮件 + 探针回传）
 scripts/dev-server.mjs 本地开发服务器（Node，无第三方依赖）
 scripts/probe-cn/      国内自托管探针（Node，无第三方依赖）
-tests/                 demo / 功能 / 安全 / 配置与 UI 四套测试，共 30 项
+tests/                 demo / 功能 / 安全 / 配置与 UI 四套测试，共 45 项
 docs/CONFIG.md         配置项与变量完整说明（先看这个）
 docs/                  架构、部署、安全测试报告
 ```
@@ -40,8 +48,16 @@ export const MONITORS = [
     type: 'website',       // website | api | service
     group: 'Public',
     enabled: true,
-    method: 'GET',
-    expectedStatus: 200,
+    method: 'GET',             // GET/HEAD/POST/PUT/PATCH/DELETE/OPTIONS
+    expectedStatus: 200,       // 单期望状态码（未填 expectedCodes 时生效）
+    // —— 进阶检测字段（可选）——
+    // expectedCodes: [200, 201],            // 多个可接受状态码，优先于 expectedStatus
+    // responseKeyword: '"ok":true',         // 响应体必须包含（只读前 64KB）
+    // responseForbiddenKeyword: 'error',    // 响应体不得包含
+    // headers: { 'X-Api-Key': 'xxx' },      // 自定义请求头（危险逐跳头自动过滤）
+    // body: '{"ping":1}',                   // 自定义请求体（GET/HEAD 忽略）
+    // retries: 1,                           // 瞬时网络故障重试次数 0-3（指数退避）
+    // tooltip: '首页健康检查', statusPageLink: 'https://example.com', hideLatencyChart: false,
     timeoutMs: 5000,
     intervalSec: 60,
     failureThreshold: 3,
@@ -53,7 +69,7 @@ export const MONITORS = [
 ];
 ```
 
-新增、删除、修改对象即可；`enabled: false` 可临时停用某项。完整字段说明见 `docs/CONFIG.md`。
+判定规则：状态码落入 `expectedCodes` 集合（默认由 `expectedStatus` 决定）+ 满足关键字正反匹配才算成功；只有超时/DNS/TLS/网络类瞬时故障才按 `retries` 重试。新增、删除、修改对象即可；`enabled: false` 可临时停用某项。完整字段说明见 `docs/CONFIG.md`。
 
 告警地址与开关**不要写在代码里**，在 Cloudflare Dashboard 设置：
 
@@ -88,7 +104,7 @@ MONITORS_JSON='[{"id":"t","name":"测试","url":"https://example.com"}]' \
 node --test tests/*.test.mjs
 ```
 
-30 项测试覆盖核心逻辑、独立检测、配置变更、告警开关、截图风格 UI（含真实执行前端脚本的 DOM 渲染测试）与安全边界。所有外部依赖通过 `env` 注入，离线可跑。
+45 项测试覆盖核心逻辑、独立检测、配置变更、告警开关、多状态码/关键字/自定义请求/重试/错误分类、事件历史与 24h 可用率、截图风格 UI（含真实执行前端脚本的 DOM 渲染测试）与安全边界。所有外部依赖通过 `env` 注入，离线可跑。
 
 ## API 摘要（只读）
 

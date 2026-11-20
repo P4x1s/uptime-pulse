@@ -110,7 +110,11 @@ test('探针隔离：任务接口只返回非敏感字段，令牌权限分离',
   assert.equal(tasksResp.status, 200);
   const { tasks } = await tasksResp.json();
   assert.equal(tasks.length, 1);
-  assert.deepEqual(Object.keys(tasks[0]).sort(), ['expectedStatus', 'id', 'intervalSec', 'method', 'probeId', 'timeoutMs', 'url']);
+  const allowed = ['body', 'expectedCodes', 'expectedStatus', 'headers', 'id', 'intervalSec', 'method',
+    'probeId', 'responseForbiddenKeyword', 'responseKeyword', 'retries', 'timeoutMs', 'url'];
+  assert.deepEqual(Object.keys(tasks[0]).sort(), allowed);
+  assert.ok(!JSON.stringify(tasks[0]).includes('owner@example.com'), '任务不得泄漏告警邮箱');
+  assert.ok(!JSON.stringify(tasks[0]).includes('https://alert.example.com'), '任务不得泄漏 Webhook 地址');
 
   const forbidden = await ctx.req('/api/monitors', {
     method: 'POST', headers: { authorization: 'Bearer probe-secret', 'content-type': 'application/json' }, body: '{}',

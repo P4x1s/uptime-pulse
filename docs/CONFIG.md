@@ -32,8 +32,17 @@
   type: 'website',                     // website | api | service（分类标签）
   group: 'Public',                     // 分组名，状态页按分组渲染卡片
   enabled: true,                       // false = 跳过检测且不在页面展示
-  method: 'GET',                       // GET | HEAD
-  expectedStatus: 200,                 // 期望状态码
+  method: 'GET',                       // GET/HEAD/POST/PUT/PATCH/DELETE/OPTIONS
+  expectedStatus: 200,                 // 单期望状态码（未填 expectedCodes 时生效）
+  expectedCodes: [200, 201],           // [可选] 多个可接受状态码，任一命中即正常，优先于 expectedStatus
+  responseKeyword: '"ok":true',        // [可选] 响应体必须包含的关键字（只读前 64KB）
+  responseForbiddenKeyword: 'error',   // [可选] 响应体不得包含的关键字
+  headers: { 'X-Api-Key': 'xxx' },     // [可选] 自定义请求头（Host 等危险逐跳头自动过滤，最多 20 个）
+  body: '{"ping":1}',                  // [可选] 自定义请求体（GET/HEAD 忽略，最长 4096）
+  retries: 1,                          // [可选] 瞬时网络故障重试次数 0-3，指数退避；默认 0
+  tooltip: '首页健康检查',             // [可选] 状态页鼠标悬停提示
+  statusPageLink: 'https://...',       // [可选] 状态页点击跳转地址（仅 http(s)，默认跳监控 url）
+  hideLatencyChart: false,             // [可选] true=隐藏该项响应时间曲线
   timeoutMs: 5000,                     // 单次超时，1000-30000
   intervalSec: 60,                     // 检测间隔，>=60 秒
   failureThreshold: 3,                 // 连续失败几次才告警，1-20
@@ -45,9 +54,12 @@
 
 字段约束：
 
-- `method` 仅 `GET` / `HEAD`；`type` 仅 `website` / `api` / `service`；其余非法值回退默认值。
-- `probes[].type`：`edge`（Cloudflare 边缘即时检测）或 `external`（国内自托管探针回传）。省略 `probes` 时默认单条 edge 线路。
-- `external` 探针的 `id` 必须与探针进程 `PROBE_ID` 一致，否则任务领取不到、回传会被拒绝（404）。
+- **成功判定**：状态码落入 `expectedCodes`（未填则用 `[expectedStatus]`），**且**响应体满足 `responseKeyword`（必须包含）与 `responseForbiddenKeyword`（不得包含）时才算正常。关键字校验最多读取响应体前 64KB，避免大响应拖慢 Worker。
+- **重试策略**：仅超时 / DNS / TLS / 网络类瞬时故障按 `retries` 重试（120ms 起指数退避，上限 400ms）；明确的 HTTP 状态码或关键字不匹配不重试。`ProbeResult.attempts` 记录实际尝试次数。
+- `method` 支持 `GET/HEAD/POST/PUT/PATCH/DELETE/OPTIONS`；`type` 仅 `website` / `api` / `service`；其余非法值回退默认值。
+- 自定义 `headers` 仅接受字符串/数字/布尔标量，自动过滤 `Host`、`Content-Length`、`Connection` 等逐跳/危险头，最多 20 个、单值 512 字符。
+- `probes[].type`：`edge`（Cloudflare 边缘即时检测）或 `external`（国内自托管探针回传）。省略 `probes` 时默认单条 edge 线路。**edge 与探针使用同一套判定逻辑**（多状态码 + 关键字 + 重试），结果一致。
+- `external` 探针的 `id` 必须与探针进程 `PROBE_ID` 一致，否则任务领取不到、回传会被拒绝（404）。探针任务接口会下发上述检测字段，且仅含非敏感字段（不含告警邮箱/Webhook 地址）。
 - `enabled: false` 的目标不检测、不展示；探针回传也只接受当前配置中存在的 ID。
 - 所有目标仍会经过 SSRF 校验：仅 http(s)、拒绝凭据、拒绝混淆 IP / 内网域名、DNS 解析后拒绝私网地址、不跟随重定向。
 - Cloudflare Workers 的 `fetch` 只能做 HTTP(S) 请求，`service` 类型表示通过 HTTP 健康检查端点监控服务，**不是**原始 TCP 端口探测。
@@ -99,11 +111,36 @@ ALERT_EMAIL_ENABLED=false
 
 ## 4. 状态页 UI
 
-按截图实现，浅色极简风格：
+在截图风格浅色极简基础上升级，信息层级与交互更完整：
 
-- 顶部：绿色对勾徽章 + "系统一切正常" + "最后更新于: … (N 秒前)"；任一目标异常时切换为红色提示"部分服务异常"。
+- 顶栏：品牌名 + `◐ 主题`（跟随系统 / 浅色 / 深色 三态切换并记忆）+ `↻ 刷新`（手动立即拉取）。
+- 顶部：绿色对勾徽章 + "系统一切正常" + "最后更新于: … (N 秒前)"；任一目标异常时切换为红色"部分服务异常"。
+- **统计摘要**：`N/N 服务在线` + `24h 可用率`（全部监控项均值）。
 - 中央卡片：分组标题（🌐 分组名）+ `N/N 在线` + 可折叠箭头。
-- 每个监控项：状态图标 + 加粗带下划线名称 + `总可用率: xx.x%`；下方为历史状态条（绿=正常、红=故障、黄=耗时异常）；再下方为 `响应时间(ms)` 折线图（含 Y 轴刻度与 X 轴小时标签）。
+- 每个监控项：
+  - 状态图标 + 名称（支持 `tooltip` 悬停提示、`statusPageLink` 跳转）+ `正常/故障` 状态标签 + `总可用率: xx.x%`
+  - 第二行元信息：`24h 可用率`、当前 `延迟 xxms`、连续失败次数
+  - 历史状态条（绿=正常、红=故障、黄=耗时异常）
+  - `响应时间(ms)` 折线图（Y 轴刻度 + X 轴小时标签，`hideLatencyChart: true` 可隐藏）
+  - **区间切换**：`24小时` / `7天` / `全部`，同时影响状态条与折线图
+- **最近故障事件**区：按时间倒序列出事件的监控项、错误类别、开始时间与持续时长（恢复后标注"已恢复"）。
+- 主题：CSS 变量驱动，`prefers-color-scheme` 跟随系统，`data-theme` 手动覆盖，写入 `localStorage` 记忆。
 - 前端零 `innerHTML` 用户数据、严格 CSP、30 秒自动刷新，不提供任何配置修改交互。
 
-`GET /api/status` 在原有字段基础上新增 `type`、`group` 和 `history`（最近 120 个数据点：`checkedAt` / `ok` / `latencyMs` / `status`），供状态条与折线图渲染。
+### `GET /api/status` 字段
+
+在原有字段基础上新增（均为只读）：
+
+| 字段 | 说明 |
+|---|---|
+| `type` / `group` | 监控项类型与分组 |
+| `history` | 最近 120 个数据点（`checkedAt`/`ok`/`latencyMs`/`status`），供状态条与折线图渲染 |
+| `uptime24h` / `samples24h` | 最近 24 小时可用率与样本数 |
+| `latencyMs` | 当前最近一次检测的耗时 |
+| `errorClass` | 最近一次错误类别（status/keyword/timeout/dns/tls/network） |
+| `tooltip` / `statusPageLink` / `hideLatencyChart` | 展示控制 |
+| `events` | 最近 10 条故障事件（每项）；顶层 `events` 为全局最近 20 条 |
+| `totalChecks` | 累计检测次数 |
+| `summary` | 全局摘要：`total`/`online`/`offline`/`uptime24h` |
+
+事件存储在 KV 的 `events:<monitorId>`（最多保留 30 条）；累计 up/down 计数存储在 `incident:<monitorId>`，兼容旧状态结构。

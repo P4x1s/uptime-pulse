@@ -43,7 +43,7 @@
 
 ## 3. 多线路模型
 
-探针抽象为 `ProbeResult { probeId, region, ok, status, latencyMs, error, checkedAt }`。
+探针抽象为 `ProbeResult { probeId, region, ok, status, latencyMs, error, errorClass, attempts, checkedAt }`。`errorClass` 为稳定错误类别（status/keyword/timeout/dns/tls/network/probe-missing），`attempts` 为实际检测次数（含重试）。
 
 - **国外线路**：Cron 在 CF 网络内执行 `fetch`，出站 IP 属 Cloudflare 全球边缘。每次结果记录执行 colo（从 `request.cf.colo` 或环境变量 `PROBE_REGION`）作为线路标识。需要多地独立探测时，部署多个 Worker 实例并设置不同 `PROBE_REGION`。
 - **国内线路**：`scripts/probe-cn` 提供无第三方依赖的 Node 探针，部署在大陆 VPS / 云函数。它调用受保护的 `/api/ingest` 上报结果，使用独立 `PROBE_TOKEN`，不暴露配置写权限。
@@ -55,21 +55,24 @@
 
 | Key | 值 | 说明 |
 |---|---|---|
-| `history:<id>` | CheckRecord[] | 最近 N 条检查记录（默认 500，环形覆盖） |
-| `incident:<id>` | IncidentState | 告警状态机（连续失败数、事件 id、最近告警时间） |
+| `history:<id>` | CheckRecord[] | 最近 N 条检查记录（默认 500，环形覆盖），含 ok/status/latencyMs/errorClass/attempts |
+| `incident:<id>` | IncidentState | 告警状态机（连续失败数、事件 id、最近告警时间）+ 累计 up/down 计数 + 当前故障起点 |
+| `events:<id>` | IncidentEvent[] | 最近 30 条故障事件（start/end/durationMs/errorClass/resolved） |
 | `probe:<id>:<probeId>` | ProbeResult | 外部探针最近一次上报 |
 | `lastrun:<id>` | number | 上次检测时间戳，用于间隔判定 |
 
-Monitor 关键字段：`id, name, url, type, group, enabled, method, expectedStatus, timeoutMs, intervalSec, failureThreshold, alertCooldownSec, alertEnabled, probes[], aggregate, webhookUrl, emailTo`。每个目标独立调度、独立历史、独立告警状态机。
+Monitor 关键字段：`id, name, url, type, group, enabled, method, expectedStatus, expectedCodes, responseKeyword, responseForbiddenKeyword, headers, body, retries, timeoutMs, intervalSec, failureThreshold, alertCooldownSec, alertEnabled, probes[], aggregate, tooltip, statusPageLink, hideLatencyChart, webhookUrl, emailTo`。每个目标独立调度、独立历史、独立告警状态机。
 
-IncidentState 关键字段：`consecutiveFailures, state(ok/warning/firing), incidentId, lastAlertAt, lastNotifiedStatus, lastErrorSignature`。
+IncidentState 关键字段：`consecutiveFailures, state(ok/firing), incidentId, lastAlertAt, lastSignature, totalChecks, upChecks, downChecks, outageStart`。累计计数与事件数组兼容旧状态（缺失字段按 0 / 空处理）。
 
 ## 5. 检测与判定
 
-1. Cron 每分钟触发；从 `src/config.mjs` 生成监控列表，按 `intervalSec` 与 `lastrun:<id>` 判断是否到期。
-2. 对到期项执行 SSRF 校验 → `fetch`（`redirect: 'manual'`，记录重定向但不自动跳转）→ 计时 → 记录 status / latency / error。
-3. 判定：超时、`status` 不在期望集合、网络错误均为失败；连续失败数达 `failureThreshold` 才进入 firing。
-4. 恢复：任一探针成功且此前 firing → 发送恢复通知，重置计数。
+1. Cron 每分钟触发；从 `src/config.mjs` 生成监控列表，并行读取 `lastrun:<id>` 判断到期项，到期项并行探测（目标间相互独立）。
+2. 探测（与 UptimeFlare 思路一致）：SSRF 校验 → 组装请求（方法/头/体）→ `fetch`（`redirect: 'manual'`，不自动跳转）→ 计时 → 记录 status / latency / error。
+3. **成功判定**：status 必须落入 `expectedCodes`（默认 `[expectedStatus]`），且满足 `responseKeyword`（含）/ `responseForbiddenKeyword`（不含）正反匹配；关键字校验只读响应体前 64KB。
+4. **重试**：仅 timeout/dns/tls/network 类瞬时故障按 `retries`（0-3）以 120ms 起指数退避重试；明确的 HTTP 状态/关键字不匹配不重试。记录 `attempts`。
+5. **错误分类**：动态错误文本归一化为稳定 `errorClass`，供告警签名去重与 UI 展示。
+6. **状态机**：连续失败数达 `failureThreshold` 才进入 firing，写入一条未恢复事件；恢复时补写事件的 end/duration 并发送恢复通知，重置计数。
 
 ## 6. 告警策略
 
@@ -99,4 +102,5 @@ IncidentState 关键字段：`consecutiveFailures, state(ok/warning/firing), inc
 - **阶段 B（功能丰富）**：模块化、邮件通道、国内探针、统计与异常记录、GitHub Actions、文档。
 - **阶段 C（安全测试）**：自动化用例覆盖 SSRF / XSS / 鉴权 / 逻辑漏洞，输出报告并修复。
 - **阶段 D（只读改造）**：移除全部配置写接口与前端增删改入口，保留只读展示与告警核心。
-- **阶段 E（本次）**：配置改为代码内集中维护（`src/config.mjs` 多目标），告警地址/开关改为环境变量驱动；UI 按截图重做为浅色状态页（徽章 + 分组卡片 + 状态条 + 响应时间曲线）。
+- **阶段 E**：配置改为代码内集中维护（`src/config.mjs` 多目标），告警地址/开关改为环境变量驱动；UI 按截图重做为浅色状态页（徽章 + 分组卡片 + 状态条 + 响应时间曲线）。
+- **阶段 F（本次）**：参考 UptimeFlare 整体升级——检测层加入多期望状态码、关键字正反匹配、自定义请求、瞬时故障重试与稳定错误分类；数据层加入累计计数与故障事件历史；接口层并行读取、新增 24h 可用率/摘要/事件；UI 加入主题切换、区间切换、状态标签、事件列表与响应式；到期目标并行探测提升性能。核心只读原则与既有 API 保持兼容，45 项测试全绿。
