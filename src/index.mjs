@@ -11,7 +11,7 @@ import {
   assertPublicTarget, safeEqual, hmacSign, probeOnce, getJson,
   getMonitors, clampInt, dashboardHtml, APP_CSS, APP_JS, getStatusPayload,
 } from './demo.mjs';
-import { resolveAlertConfig } from './config.mjs';
+import { resolveAlertConfig, buildWebhookBody } from './config.mjs';
 
 const SECURITY_HEADERS = {
   'X-Content-Type-Options': 'nosniff',
@@ -39,7 +39,10 @@ async function postJson(env, target, body, headers) {
 
 async function sendWebhook(url, payload, env) {
   const target = await assertPublicTarget(url, env.resolveDns);
-  const body = JSON.stringify(payload);
+  // Server酱/Turbo（.send 或带 text/title/desp）只认 body 中的 title/desp，忽略 query；
+  // 标准 Webhook（含 ntfy 原生端点）继续接收完整 JSON 告警 payload。
+  const built = buildWebhookBody(url, payload);
+  const body = JSON.stringify(built.body);
   const headers = { 'user-agent': 'UptimePulse/1.0 (+alert)' };
   if (env.ALERT_SIGNING_SECRET) headers['x-uptimepulse-signature'] = `sha256=${await hmacSign(body, env.ALERT_SIGNING_SECRET)}`;
   await postJson(env, target.toString(), body, headers);

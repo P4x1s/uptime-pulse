@@ -6,7 +6,7 @@
  * 服务端读取配置生成监控列表；前端只读展示；不提供任何修改监控配置的接口或入口。
  * 同一份代码可部署为 Worker，也可由 scripts/dev-server.mjs 本地运行。
  */
-import { MONITORS, resolveAlertConfig } from './config.mjs';
+import { MONITORS, resolveAlertConfig, buildWebhookBody } from './config.mjs';
 
 // ---------- 常量与类型 ----------
 const SECURITY_HEADERS = {
@@ -261,13 +261,16 @@ async function sendWebhook(monitor, type, record, state, env) {
   const url = (monitor.alertEnabled !== false && monitor.webhookUrl) ? monitor.webhookUrl : cfg.webhook.url;
   if (!cfg.webhook.enabled || !url) return;
   const target = await assertPublicTarget(url, env.resolveDns || dohResolve);
-  const body = JSON.stringify({
+  const alert = {
     type,
     monitor: { id: monitor.id, name: monitor.name, url: monitor.url },
     result: record,
     state,
     timestamp: new Date().toISOString(),
-  });
+  };
+  // 兼容 Server酱 .send（body 必须含 title/desp）与标准 JSON Webhook/ntfy 原生端点
+  const built = buildWebhookBody(url, alert);
+  const body = JSON.stringify(built.body);
   const secret = cfg.signingSecret;
   const headers = { 'content-type': 'application/json', 'user-agent': 'UptimePulse/1.0 (+alert)' };
   if (secret) headers['x-uptimepulse-signature'] = `sha256=${await hmacSign(body, secret)}`;

@@ -119,3 +119,36 @@ export function resolveAlertConfig(env = {}) {
     failureThreshold,
   };
 }
+
+/**
+ * 构造 Webhook 请求正文，兼容两类接收端：
+ *  1) Server酱 / Turbo / 同类网关（URL 以 .send 结尾，或 query 含 text/title/desp）：
+ *     服务端只从 body 读 title/desp，忽略 query。此处读取 URL 中的预设文案作为模板，
+ *     并把告警详情附到 desp，返回 { style:'serverchan', body:{title,desp} }。
+ *  2) 标准 Webhook / ntfy 原生：返回 { style:'json', body:payload }。
+ * 预设文案（如 text=【服务监测】、desp=监测服务出现故障！）始终被保留。
+ */
+export function buildWebhookBody(url, payload) {
+  let u;
+  try { u = new URL(url); } catch { return { style: 'json', body: payload }; }
+  const isServerChan = /\.send$/i.test(u.pathname) || u.searchParams.has('text')
+    || u.searchParams.has('title') || u.searchParams.has('desp');
+  const detail = [
+    `监控项: ${payload.monitor?.name || payload.monitor?.id || ''}`,
+    `目标: ${payload.monitor?.url || ''}`,
+    `状态: ${payload.type === 'firing' ? '故障 firing' : '恢复 recovered'}`,
+    `HTTP: ${payload.result?.status ?? '-'}`,
+    `耗时: ${payload.result?.latencyMs ?? '-'}ms`,
+    `线路: ${payload.result?.region || ''}`,
+    payload.result?.error ? `错误: ${payload.result.error}` : '',
+    `时间: ${payload.timestamp}`,
+  ].filter(Boolean).join('\n');
+  if (isServerChan) {
+    const presetTitle = u.searchParams.get('text') || u.searchParams.get('title') || '【服务监测】';
+    const presetDesp = u.searchParams.get('desp') || '监测服务出现故障！';
+    const title = payload.type === 'recovered' ? `${presetTitle} 已恢复` : presetTitle;
+    const desp = `${presetDesp}\n\n${detail}`;
+    return { style: 'serverchan', body: { title, desp } };
+  }
+  return { style: 'json', body: payload };
+}

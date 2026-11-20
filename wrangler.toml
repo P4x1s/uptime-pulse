@@ -16,7 +16,7 @@ crons = ["* * * * *"]
 #
 # 告警地址与开关请在 Dashboard → Worker → Variables and Secrets 设置（不要写死在代码里）：
 #   ALERT_WEBHOOK_ENABLED  Webhook 开关：true/false（未设置时，填了地址即开启）
-#   ALERT_WEBHOOK_URL      Webhook 通知地址（兼容旧变量 WEBHOOK_URL）；URL 中的查询参数会原样保留
+#   ALERT_WEBHOOK_URL      Webhook 通知地址（兼容旧变量 WEBHOOK_URL）；Server酱 .send 会自动提取 text/desp 预设文案并作为 body 的 title/desp 发送
 #   ALERT_FAILURE_THRESHOLD  失败阈值：设 1 = 检测到宕机/无法联通立即推送（推荐）；未设置则沿用监控项默认值
 #   ALERT_EMAIL_ENABLED    邮件开关：true/false（未设置时，邮件传输就绪即开启）
 #   ALERT_EMAIL_TO         邮件收件人（兼容旧变量 EMAIL_TO）

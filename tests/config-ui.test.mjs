@@ -5,7 +5,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createWorker, runDueChecks } from '../src/index.mjs';
 import { dashboardHtml, APP_CSS, APP_JS } from '../src/demo.mjs';
-import { MONITORS, resolveAlertConfig } from '../src/config.mjs';
+import { MONITORS, resolveAlertConfig, buildWebhookBody } from '../src/config.mjs';
 
 class MockKV {
   constructor() { this.store = new Map(); }
@@ -239,7 +239,7 @@ test('未设置 ALERT_FAILURE_THRESHOLD 时沿用监控项阈值，保持原行�
 });
 
 test('Webhook 地址原样保留查询参数（ntfy 预设文案不被破坏）', async () => {
-  const ntfy = 'https://ntfy.588816.xyz/731a92d577eef1467d69ae13f4f1633441edf9e275c9555083cd648707825c04.send?text=【服务监测】&desp=监测服务出现故障！';
+  const ntfy = 'https://ntfy.example.com/test-token.send?text=【服务监测】&desp=监测服务出现故障！';
   const ctx = makeEnv({
     MONITORS: [target({ failureThreshold: 1 })],
     ALERT_WEBHOOK_URL: ntfy,
@@ -248,7 +248,7 @@ test('Webhook 地址原样保留查询参数（ntfy 预设文案不被破坏）'
   });
   let delivered = null;
   ctx.env.fetchImpl = async (url, init = {}) => {
-    if (String(url).includes('ntfy.588816.xyz')) {
+    if (String(url).includes('ntfy.example.com')) {
       delivered = { url: String(url), method: init.method, body: init.body };
       return new Response('', { status: 200 });
     }
@@ -259,4 +259,41 @@ test('Webhook 地址原样保留查询参数（ntfy 预设文案不被破坏）'
   assert.ok(delivered.url.includes('text=') && delivered.url.includes('desp='), '预设查询参数应保留');
   assert.ok(decodeURIComponent(delivered.url).includes('【服务监测】'), '预设文案应原样保留（URL 编码后等价）');
   assert.equal(delivered.method, 'POST');
+});
+
+test('Server酱 .send 端点自动改用 title/desp body，预设文案与故障详情都送达', async () => {
+  const url = 'https://ntfy.example.com/test-token.send?text=【服务监测】&desp=监测服务出现故障！';
+  const ctx = makeEnv({
+    MONITORS: [target({ failureThreshold: 1 })],
+    ALERT_WEBHOOK_URL: url,
+    ALERT_FAILURE_THRESHOLD: '1',
+    resolveDns: async () => ['93.184.216.34'],
+  });
+  let delivered = null;
+  ctx.env.fetchImpl = async (u, init = {}) => {
+    if (String(u).includes('ntfy.example.com')) {
+      delivered = { url: String(u), body: JSON.parse(init.body) };
+      return new Response('', { status: 200 });
+    }
+    return new Response('', { status: 503 });
+  };
+  await runDueChecks(ctx.env, true);
+  assert.ok(delivered, '应投递告警');
+  assert.equal(delivered.body.title, '【服务监测】', '预设标题应从 query 提取到 body');
+  assert.ok(delivered.body.desp.startsWith('监测服务出现故障！'), '预设正文应保留');
+  assert.ok(delivered.body.desp.includes('服务 A'), '正文应附故障详情');
+  assert.ok(delivered.body.desp.includes('故障 firing'));
+  assert.equal(delivered.body.type, undefined, 'Server酱端点不应发送完整 JSON payload');
+});
+
+test('buildWebhookBody 兼容标准端点与恢复通知', () => {
+  const payload = {
+    type: 'recovered', monitor: { id: 'm1', name: '服务 A', url: 'https://a.example.com' },
+    result: { ok: true, status: 200, latencyMs: 12 }, state: { state: 'ok' }, timestamp: '2026-01-01T00:00:00.000Z',
+  };
+  assert.deepEqual(buildWebhookBody('https://alert.example.com/hook', payload).body, payload, '标准端点保持完整 payload');
+  const serverchan = buildWebhookBody('https://ntfy.example.com/token.send?text=【服务监测】', payload);
+  assert.equal(serverchan.style, 'serverchan');
+  assert.equal(serverchan.body.title, '【服务监测】 已恢复');
+  assert.ok(serverchan.body.desp.includes('恢复 recovered'));
 });

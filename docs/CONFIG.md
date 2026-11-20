@@ -59,7 +59,7 @@
 | 变量名 | 类型 | 默认行为 | 说明 |
 |---|---|---|---|
 | `ALERT_WEBHOOK_ENABLED` | 变量 | 未设置时，填了地址即开启 | `true`/`false`（也接受 1/0、yes/no、on/off）；`false` 强制关闭 Webhook |
-| `ALERT_WEBHOOK_URL` | Secret 或变量 | 空=不发送 | Webhook 接收地址（兼容旧变量 `WEBHOOK_URL`，新变量优先）；URL 中的查询参数（如 ntfy/Server酱的 `text`/`desp` 预设文案）会原样保留 |
+| `ALERT_WEBHOOK_URL` | Secret 或变量 | 空=不发送 | Webhook 接收地址（兼容旧变量 `WEBHOOK_URL`，新变量优先）；Server酱/Turbo 风格 `.send` 或 URL 带 `text`/`title`/`desp` 时，预设文案会被提取到 JSON body 的 `title`/`desp` 中，普通 Webhook 则发送完整 JSON 告警对象 |
 | `ALERT_FAILURE_THRESHOLD` | 变量 | 未设置时沿用监控项 `failureThreshold`（默认 3） | **设为 1 = 检测到宕机/无法联通立即推送**（推荐）；1-20，对所有监控项生效，优先级高于单项配置 |
 | `ALERT_EMAIL_ENABLED` | 变量 | 未设置时，邮件传输就绪即开启 | `false` 强制关闭邮件 |
 | `ALERT_EMAIL_TO` | 变量 | 空=使用监控项上的 `emailTo` | 全局收件人（兼容旧变量 `EMAIL_TO`，新变量优先） |
@@ -79,16 +79,21 @@
 
 ### ntfy / Server酱 Webhook 示例（本次线上采用）
 
-把带预设文案的完整 URL 直接填进 `ALERT_WEBHOOK_URL` 即可，查询参数会被原样保留，请求以 `POST` + JSON body 发出：
+把带预设文案的完整 URL 直接填进 `ALERT_WEBHOOK_URL` 即可，查询参数在请求 URL 中原样保留，同时服务端会自动转换成接收端真正读取的 JSON body：
 
 ```
 ALERT_WEBHOOK_ENABLED=true
-ALERT_WEBHOOK_URL=https://ntfy.588816.xyz/<your-token>.send?text=【服务监测】&desp=监测服务出现故障！
+ALERT_WEBHOOK_URL=https://ntfy.example.com/<your-token>.send?text=【服务监测】&desp=监测服务出现故障！
 ALERT_FAILURE_THRESHOLD=1
 ALERT_EMAIL_ENABLED=false
 ```
 
-告警触发时，服务端向该地址 POST 一段 JSON（含 `type`、`monitor`、`result`、`state`、`timestamp`）；ntfy/Server酱端点读取 query 中的 `text`/`desp` 文案推送通知。若需要把具体故障信息也写进通知正文，可在 URL 的 `desp` 参数中使用各平台支持的模板变量。
+告警触发时：
+
+- **Server酱 Turbo / `.send` 端点**：POST `{"title":"【服务监测】","desp":"监测服务出现故障！\n\n<故障详情>"}`。实测该端点忽略 query，只读取 body 中的 `title`/`desp`，因此预设文案与故障详情都会真正送达；恢复通知的标题会自动加上「已恢复」。
+- **标准 Webhook / ntfy 原生端点**：POST 完整 JSON 对象（`type`、`monitor`、`result`、`state`、`timestamp`）。
+
+如果配置了 `ALERT_SIGNING_SECRET`，签名覆盖实际发送的 JSON body。
 
 ## 4. 状态页 UI
 
