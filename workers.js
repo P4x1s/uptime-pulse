@@ -40,7 +40,8 @@
  *   body             自定义请求体字符串（GET/HEAD 忽略，最长 4096）
  *   retries          瞬时网络故障（超时/DNS/TLS/网络）重试次数 0-3，默认 0；指数退避
  *   timeoutMs        单次超时（1000-30000），默认 5000
- *   intervalSec      检测间隔（>=60），默认 60
+ *   intervalSec      检测间隔（>=60），默认 60；KV 免费额度按写入次数计费（全账户共享 1000 次/天），
+ *                    本代码已合并为每轮检测仅 1 次 KV 写入，建议 intervalSec >= 1200（20 分钟，72 写/天）
  *   failureThreshold 连续失败多少次才触发告警（1-20），默认 3
  *   alertCooldownSec 同一事件告警冷却秒数，默认 300
  *   aggregate        多线路聚合：any（任一线路成功即正常）| all（全部成功才正常）
@@ -59,7 +60,7 @@
 export const MONITORS = [
   {
     id: "tv",
-    name: "Home TV",
+    name: "TV",
     url: "https://tv.example.com/",
     type: "website",
     group: "Public",
@@ -74,7 +75,7 @@ export const MONITORS = [
     // method: 'GET', headers: { 'X-Api-Key': '...' }, body: '', retries: 1,
     // tooltip: '首页健康检查', statusPageLink: 'https://tv.example.com/', hideLatencyChart: false,
     timeoutMs: 5000,
-    intervalSec: 60,
+    intervalSec: 1200,
     failureThreshold: 3,
     aggregate: "any",
     probes: [{ id: "edge-main", type: "edge", region: "cf-edge" }]
@@ -89,7 +90,7 @@ export const MONITORS = [
     method: "GET",
     expectedStatus: 200,
     timeoutMs: 5000,
-    intervalSec: 60,
+    intervalSec: 1200,
     failureThreshold: 3,
     alertCooldownSec: 300,
     aggregate: "any",
@@ -105,7 +106,7 @@ export const MONITORS = [
     method: "GET",
     expectedStatus: 200,
     timeoutMs: 5000,
-    intervalSec: 60,
+    intervalSec: 1200,
     failureThreshold: 2,
     aggregate: "any",
     probes: [{ id: "edge-main", type: "edge", region: "cf-edge" }]
@@ -120,7 +121,7 @@ export const MONITORS = [
     method: "GET",
     expectedStatus: 200,
     timeoutMs: 5000,
-    intervalSec: 60,
+    intervalSec: 1200,
     failureThreshold: 2,
     aggregate: "any",
     probes: [{ id: "edge-main", type: "edge", region: "cf-edge" }]
@@ -135,7 +136,7 @@ export const MONITORS = [
     method: "GET",
     expectedStatus: 200,
     timeoutMs: 5000,
-    intervalSec: 60,
+    intervalSec: 1200,
     failureThreshold: 2,
     aggregate: "any",
     probes: [{ id: "edge-main", type: "edge", region: "cf-edge" }]
@@ -151,7 +152,7 @@ export const MONITORS = [
     expectedStatus: 401,
     // 根路径受保护，401 即视为服务正常；告警仍走 .send 端点
     timeoutMs: 5000,
-    intervalSec: 60,
+    intervalSec: 1200,
     failureThreshold: 2,
     aggregate: "any",
     probes: [{ id: "edge-main", type: "edge", region: "cf-edge" }]
@@ -721,11 +722,12 @@ async function getStatusPayload(env) {
   const enabled = monitors.filter((m) => m.enabled);
   const now = Date.now();
 
-  // 并行读取每个目标的历史 / 事件，减少 KV 往返
+  // 快照单键读取（1 次 KV 读）；事件仍为独立键、并行读取
+  const snap = await loadSnapshot(env, monitors);
   const snapshots = await Promise.all(enabled.map(async (m) => ({
     m,
-    history: asArray(await getJson(env.KV, `history:${m.id}`, [])),
-    incident: asObject(await getJson(env.KV, `incident:${m.id}`, { state: 'ok', consecutiveFailures: 0 })),
+    history: asArray(snap.history[m.id] || []),
+    incident: asObject(snap.incident[m.id] || { state: 'ok', consecutiveFailures: 0 }),
     events: asArray(await getJson(env.KV, `events:${m.id}`, [])),
   })));
 
@@ -1012,9 +1014,8 @@ function aggregateResults(results, mode) {
   };
 }
 
-async function applyIncident(monitor, aggregated, env) {
-  const key = `incident:${monitor.id}`;
-  let state = { ...defaultIncident(), ...asObject(await getJson(env.KV, key, {})) };
+async function applyIncident(monitor, aggregated, env, snap) {
+  let state = { ...defaultIncident(), ...asObject(snap.incident[monitor.id] || {}) };
   state.totalChecks = Number(state.totalChecks) || 0;
   state.upChecks = Number(state.upChecks) || 0;
   state.downChecks = Number(state.downChecks) || 0;
@@ -1070,32 +1071,69 @@ async function applyIncident(monitor, aggregated, env) {
       }
     }
   }
-  await env.KV.put(key, JSON.stringify(state));
+  // 状态写回内存快照，由调用方在整轮结束时统一单次写回 KV
+  snap.incident[monitor.id] = state;
   return state;
 }
 
-async function commitRound(monitor, results, env) {
+async function commitRound(monitor, results, env, snap) {
   const aggregated = aggregateResults(results, monitor.aggregate);
-  const state = await applyIncident(monitor, aggregated, env);
-  const history = asArray(await getJson(env.KV, `history:${monitor.id}`, []));
+  const state = await applyIncident(monitor, aggregated, env, snap);
+  const history = asArray(snap.history[monitor.id] || []);
   history.unshift({ checkedAt: new Date().toISOString(), ...aggregated, results, incidentState: state.state });
   if (history.length > MAX_HISTORY) history.length = MAX_HISTORY;
-  await env.KV.put(`history:${monitor.id}`, JSON.stringify(history));
-  await env.KV.put(`lastrun:${monitor.id}`, Date.now());
+  snap.history[monitor.id] = history;
+  snap.lastrun[monitor.id] = Date.now();
   return { aggregated, state };
+}
+
+// ---------- KV 快照合并（免费额度优化：每轮检测仅 1 次写入） ----------
+// 所有监控的 incident / history / lastrun 合并存于 snapshot:all 单键：
+// 每轮 Cron 开始时读 1 次、检测结束后写回 1 次，写入次数与监控数量解耦。
+// 注意单写者原则：只有 Cron 轮次写快照；探针回传只写 probe:* 独立键，由下一轮到期时收割评估。
+const SNAPSHOT_KEY = 'snapshot:all';
+
+function emptySnapshot() {
+  return { v: 1, lastrun: {}, incident: {}, history: {} };
+}
+
+/** 读取快照；键不存在（首次运行/新 KV）时从旧版分散键迁移，避免历史数据丢失 */
+async function loadSnapshot(env, monitors) {
+  const snap = asObject(await getJson(env.KV, SNAPSHOT_KEY, {}));
+  if (snap.v === 1) {
+    snap.lastrun = asObject(snap.lastrun);
+    snap.incident = asObject(snap.incident);
+    snap.history = asObject(snap.history);
+    return snap;
+  }
+  const fresh = emptySnapshot();
+  await Promise.all(monitors.map(async (m) => {
+    fresh.incident[m.id] = { ...defaultIncident(), ...asObject(await getJson(env.KV, `incident:${m.id}`, {})) };
+    fresh.history[m.id] = asArray(await getJson(env.KV, `history:${m.id}`, []));
+    fresh.lastrun[m.id] = Number(await getJson(env.KV, `lastrun:${m.id}`, 0)) || 0;
+  }));
+  return fresh;
+}
+
+/** 整份快照单次写回（替代旧版每监控 3 次 put） */
+function saveSnapshot(env, snap) {
+  return env.KV.put(SNAPSHOT_KEY, JSON.stringify(snap));
 }
 
 /** 到期监控项：edge 线路即时探测；external 线路读取最近上报 */
 async function runDueChecks(env, force = false) {
   const monitors = await getMonitors(env);
   const now = Date.now();
+  const snap = await loadSnapshot(env, monitors);
   const candidates = monitors.filter((m) => m.enabled).map((m) => ({
     m, intervalMs: Math.max(60, m.intervalSec || 60) * 1000,
   }));
-  const lastRuns = await Promise.all(candidates.map(({ m }) => getJson(env.KV, `lastrun:${m.id}`, 0)));
-  const due = candidates.filter(({ m, intervalMs }, i) => force || now - (Number(lastRuns[i]) || 0) >= intervalMs).map(({ m }) => m);
+  const due = candidates
+    .filter(({ m, intervalMs }) => force || now - (Number(snap.lastrun[m.id]) || 0) >= intervalMs)
+    .map(({ m }) => m);
+  if (!due.length) return [];
 
-  return Promise.all(due.map(async (m) => {
+  const rounds = await Promise.all(due.map(async (m) => {
     const results = [];
     for (const probe of m.probes || []) {
       if (probe.type === 'edge') {
@@ -1114,8 +1152,10 @@ async function runDueChecks(env, force = false) {
         }
       }
     }
-    return { id: m.id, ...(await commitRound(m, results, env)) };
+    return { id: m.id, ...(await commitRound(m, results, env, snap)) };
   }));
+  await saveSnapshot(env, snap); // 整轮仅 1 次 KV 写入
+  return rounds;
 }
 
 // ---------- 鉴权（仅探针回传仍需令牌；配置接口已移除） ----------
@@ -1189,25 +1229,9 @@ export function createWorker(env) {
         receivedAt: Date.now(),
       };
       await env.KV.put(`probe:${id}:${probeId}`, JSON.stringify(report));
-      // 仅当所有线路都有新鲜结果时才形成一个完整轮次，避免历史样本失真。
-      // 注意：edge 线路的探测结果从不写入 probe:* KV（由 scheduled 即时探测），
-      // 因此这里对 edge 线路即时补探，否则 edge+external 混合配置将永远 allFresh=false。
-      const results = [];
-      const freshMs = Math.max(120, monitor.intervalSec * 3) * 1000;
-      let allFresh = true;
-      for (const p of monitor.probes || []) {
-        if (p.id === probeId) { results.push(report); continue; }
-        if (p.type === 'edge') { results.push(await probeOnce(monitor, env)); continue; }
-        const r = asObject(await getJson(env.KV, `probe:${id}:${p.id}`, null));
-        if (r.receivedAt && Date.now() - r.receivedAt <= freshMs) {
-          results.push({ ...r, errorClass: r.errorClass || errorClass(r.error), attempts: r.attempts || 1 });
-        } else allFresh = false;
-      }
-      if (allFresh) {
-        const evaluated = await commitRound(monitor, results, env);
-        return json({ ok: true, evaluated: true, ...evaluated });
-      }
-      return json({ ok: true, evaluated: false, pending: results.length });
+      // 单写者原则：探针结果只落 probe:* 独立键，快照仅由 Cron 轮次在到期时
+      // 读取并评估（external 线路取新鲜上报），避免 ingest 与 Cron 并发写快照互相覆盖。
+      return json({ ok: true, stored: true });
     }
 
     return json({ error: '未找到' }, 404);
