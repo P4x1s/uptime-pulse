@@ -36,14 +36,14 @@ function makeEnv(overrides = {}) {
   };
   const resolveDns = async (host) => (host === 'dns-private.example.com' ? ['10.0.0.5'] : ['93.184.216.34']);
   const env = {
-    KV, ADMIN_TOKEN: 'test-token', PROBE_REGION: 'test-line', MONITOR_TARGETS: '',
+    KV, ADMIN_TOKEN: 'test-token', PROBE_REGION: 'test-line', MONITORS: [],
     WEBHOOK_URL: 'https://alert.example.com/hook', ALERT_SIGNING_SECRET: 'test-secret',
     resolveDns, fetchImpl,
   };
   return {
     env, KV, alerts, calls,
     setResponder: (fn) => { responder = fn; },
-    setTargets: (targets) => { env.MONITOR_TARGETS = JSON.stringify(targets); },
+    setTargets: (targets) => { env.MONITORS = targets; },
     ...overrides,
   };
 }
@@ -129,7 +129,7 @@ test('告警状态机: 阈值触发 / 同签名去重 / 恢复通知 / 签名可
   assert.equal(state.consecutiveFailures, 0);
 });
 
-test('可用率与异常记录: 状态接口按后台变量目标的历史计算', async () => {
+test('可用率与异常记录: 状态接口按代码配置目标的历史计算', async () => {
   const ctx = makeEnv();
   const m = makeMonitor();
   ctx.setTargets([m]);

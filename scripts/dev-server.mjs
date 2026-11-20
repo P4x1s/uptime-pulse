@@ -42,8 +42,12 @@ const env = {
   RESEND_API_KEY: process.env.RESEND_API_KEY || '',
   EMAIL_FROM: process.env.EMAIL_FROM || '',
   PROBE_TOKEN: process.env.PROBE_TOKEN || 'demo-probe-token',
-  // 监控目标统一由后台变量提供（本地可用 MONITOR_TARGETS 环境变量注入）
-  MONITOR_TARGETS: process.env.MONITOR_TARGETS || '',
+  // 默认使用 src/config.mjs 的 MONITORS；本地可用 MONITORS_JSON 覆盖以便调试
+  MONITORS: process.env.MONITORS_JSON ? JSON.parse(process.env.MONITORS_JSON) : undefined,
+  ALERT_WEBHOOK_ENABLED: process.env.ALERT_WEBHOOK_ENABLED || '',
+  ALERT_WEBHOOK_URL: process.env.ALERT_WEBHOOK_URL || process.env.WEBHOOK_URL || '',
+  ALERT_EMAIL_ENABLED: process.env.ALERT_EMAIL_ENABLED || '',
+  ALERT_EMAIL_TO: process.env.ALERT_EMAIL_TO || process.env.EMAIL_TO || '',
   resolveDns,
   fetchImpl: (...args) => fetch(...args),
 };
@@ -80,5 +84,5 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(port, () => {
   console.log(`UptimePulse dev server (${workerPath}) → http://localhost:${port}`);
-  console.log(`只读模式：监控目标来自后台变量 MONITOR_TARGETS（当前 ${env.MONITOR_TARGETS ? '已配置' : '为空'}）`);
+  console.log(`只读模式：监控目标来自 src/config.mjs 的 MONITORS${env.MONITORS ? '（本地 MONITORS_JSON 覆盖）' : ''}`);
 });

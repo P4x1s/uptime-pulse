@@ -40,7 +40,7 @@ function makeCtx() {
     KV, ADMIN_TOKEN: 'admin-secret', PROBE_TOKEN: 'probe-secret',
     WEBHOOK_URL: 'https://alert.example.com/global', ALERT_SIGNING_SECRET: 'sign-secret',
     RESEND_API_KEY: 're_test_key', EMAIL_FROM: 'UptimePulse <alerts@example.com>',
-    PROBE_REGION: 'cf-test', MONITOR_TARGETS: '',
+    PROBE_REGION: 'cf-test', MONITORS: [],
     resolveDns: async () => ['93.184.216.34'],
     fetchImpl,
   };
@@ -49,7 +49,7 @@ function makeCtx() {
   return {
     env, KV, webhooks, emails, outbound, req,
     check: () => runDueChecks(env, true),
-    setTargets: (targets) => { env.MONITOR_TARGETS = JSON.stringify(targets); },
+    setTargets: (targets) => { env.MONITORS = targets; },
     setTargetStatus: (s) => { targetStatus = s; },
     setEmailFails: (v) => { emailFails = v; },
   };
@@ -62,7 +62,7 @@ function target(overrides = {}) {
   };
 }
 
-test('配置只读：写接口全部禁用，列表由后台变量生成', async () => {
+test('配置只读：写接口全部禁用，列表由代码配置生成', async () => {
   const ctx = makeCtx();
   const adminHeaders = { authorization: 'Bearer admin-secret', 'content-type': 'application/json' };
   assert.equal((await ctx.req('/api/monitors', { method: 'POST', headers: adminHeaders, body: '{"url":"https://x.example.com"}' })).status, 405);
@@ -78,7 +78,7 @@ test('配置只读：写接口全部禁用，列表由后台变量生成', async
   assert.equal(status.monitors[0].name, '电商首页');
 });
 
-test('后台变量更新后展示与检测同步生效', async () => {
+test('配置变更后展示与检测同步生效', async () => {
   const ctx = makeCtx();
   ctx.setTargets([target({ id: 'a', name: 'A', url: 'https://a.example.com' })]);
   let s = await (await ctx.req('/api/status')).json();
@@ -97,7 +97,7 @@ test('后台变量更新后展示与检测同步生效', async () => {
 
   ctx.setTargets([]);
   s = await (await ctx.req('/api/status')).json();
-  assert.equal(s.monitors.length, 0, '从变量移除的目标应立即从展示消失');
+  assert.equal(s.monitors.length, 0, '从配置移除的目标应立即从展示消失');
 });
 
 test('探针隔离：任务接口只返回非敏感字段，令牌权限分离', async () => {

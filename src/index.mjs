@@ -1,15 +1,17 @@
 /**
  * UptimePulse - 完整版 Worker（只读版）
  *
- * 监控目标统一由后台变量 MONITOR_TARGETS 提供（Cloudflare Dashboard 变量/Secret）。
- * 服务端读取变量生成监控列表；前端只读展示；不提供任何修改监控配置的接口或入口。
+ * 监控目标在 src/config.mjs 的 MONITORS 数组中集中维护，每个目标独立检测、独立告警。
+ * 告警通知地址与开关来自环境变量（ALERT_*），不在代码中写死。
+ * 前端只读展示；不提供任何修改监控配置的接口或入口。
  * 保留：多线路聚合、国内探针回传、邮件 + Webhook 双通道、历史与异常查询。
- * 安全原语复用 src/demo.mjs，避免两套实现产生分歧。
+ * 安全原语与状态接口复用 src/demo.mjs，避免两套实现产生分歧。
  */
 import {
   assertPublicTarget, safeEqual, hmacSign, probeOnce, getJson,
-  getMonitors, clampInt, dashboardHtml, APP_CSS, APP_JS,
+  getMonitors, clampInt, dashboardHtml, APP_CSS, APP_JS, getStatusPayload,
 } from './demo.mjs';
+import { resolveAlertConfig } from './config.mjs';
 
 const SECURITY_HEADERS = {
   'X-Content-Type-Options': 'nosniff',
@@ -44,7 +46,8 @@ async function sendWebhook(url, payload, env) {
 }
 
 async function sendEmail(to, payload, env) {
-  if (!env.RESEND_API_KEY || !env.EMAIL_FROM) return;
+  const cfg = resolveAlertConfig(env);
+  if (!cfg.mail.apiKey || !cfg.mail.from || !to) return;
   // 邮件端点为硬编码可信域名，不接受用户输入
   const subject = `[UptimePulse][${payload.type === 'firing' ? '故障' : '恢复'}] ${payload.monitor.name || payload.monitor.url}`;
   const lines = [
@@ -59,11 +62,14 @@ async function sendEmail(to, payload, env) {
     payload.result.error ? `错误: ${payload.result.error}` : '',
   ].filter(Boolean);
   await postJson(env, 'https://api.resend.com/emails', JSON.stringify({
-    from: env.EMAIL_FROM, to: [to], subject, text: lines.join('\n'),
-  }), { authorization: `Bearer ${env.RESEND_API_KEY}` });
+    from: cfg.mail.from, to: [to], subject, text: lines.join('\n'),
+  }), { authorization: `Bearer ${cfg.mail.apiKey}` });
 }
 
+/** 告警地址与开关来自 env（ALERT_*）；监控项可选覆盖，但 alertEnabled:false 可整体关闭该项告警 */
 async function dispatchAlerts(monitor, type, record, state, env) {
+  if (monitor.alertEnabled === false) return;
+  const cfg = resolveAlertConfig(env);
   const payload = {
     type,
     monitor: { id: monitor.id, name: monitor.name, url: monitor.url },
@@ -72,9 +78,14 @@ async function dispatchAlerts(monitor, type, record, state, env) {
     timestamp: new Date().toISOString(),
   };
   const jobs = [];
-  if (env.WEBHOOK_URL) jobs.push(sendWebhook(env.WEBHOOK_URL, payload, env).catch((e) => console.error('全局 Webhook 失败', e)));
-  if (monitor.webhookUrl) jobs.push(sendWebhook(monitor.webhookUrl, payload, env).catch((e) => console.error('监控项 Webhook 失败', e)));
-  if (monitor.emailTo) jobs.push(sendEmail(monitor.emailTo, payload, env).catch((e) => console.error('邮件告警失败', e)));
+  const webhookUrl = monitor.webhookUrl || cfg.webhook.url;
+  if (cfg.webhook.enabled && webhookUrl) {
+    jobs.push(sendWebhook(webhookUrl, payload, env).catch((e) => console.error('Webhook 告警失败', e)));
+  }
+  const emailTo = monitor.emailTo || cfg.email.to;
+  if (cfg.email.enabled && emailTo) {
+    jobs.push(sendEmail(emailTo, payload, env).catch((e) => console.error('邮件告警失败', e)));
+  }
   await Promise.allSettled(jobs);
 }
 
@@ -194,32 +205,12 @@ export function createWorker(env) {
     if (path === '/app.css' && method === 'GET') return text(APP_CSS, 200, 'text/css; charset=utf-8');
     if (path === '/app.js' && method === 'GET') return text(APP_JS, 200, 'application/javascript; charset=utf-8');
 
-    if (path === '/api/status' && method === 'GET') {
-      const monitors = await getMonitors(env);
-      const out = [], recentErrors = [];
-      for (const m of monitors) {
-        const history = await getJson(env.KV, `history:${m.id}`, []);
-        const incident = await getJson(env.KV, `incident:${m.id}`, { state: 'ok', consecutiveFailures: 0 });
-        const okCount = history.filter((h) => h.ok).length;
-        out.push({
-          id: m.id, name: m.name, url: m.url, enabled: m.enabled, probes: m.probes,
-          state: incident.state, consecutiveFailures: incident.consecutiveFailures,
-          last: history[0] || null,
-          uptime: history.length ? okCount / history.length : 1, samples: history.length,
-        });
-        if (history[0] && !history[0].ok) {
-          for (const r of history[0].results || []) {
-            if (!r.ok) recentErrors.push({ checkedAt: history[0].checkedAt, monitorName: m.name || m.url, region: r.region, status: r.status, error: r.error });
-          }
-        }
-      }
-      return json({ monitors: out, recentErrors: recentErrors.slice(0, 30), serverTime: new Date().toISOString() });
-    }
+    if (path === '/api/status' && method === 'GET') return json(await getStatusPayload(env));
 
     // 只读模式：任何修改监控配置的接口一律禁用（含历史接口，避免暴露内部数据）
     if (path === '/api/monitors' || path.startsWith('/api/monitors/') || path === '/api/check'
       || /^\/api\/monitors\/[^/]+\/history$/.test(path)) {
-      return json({ error: '只读模式：监控目标由服务端后台变量管理，不支持修改' }, 405);
+      return json({ error: '只读模式：监控目标由服务端配置统一管理，不支持修改' }, 405);
     }
 
     // 探针任务：仅返回分配给该探针的非敏感字段
@@ -235,7 +226,7 @@ export function createWorker(env) {
       return json({ tasks, serverTime: Date.now() });
     }
 
-    // 探针回传：独立令牌；只能回传当前后台变量中存在的监控项，不能改配置
+    // 探针回传：独立令牌；只能回传当前配置中的监控项，不能改配置
     if (path === '/api/ingest' && method === 'POST') {
       if (!isProbe(request, env)) return json({ error: '未授权' }, 401);
       let body;

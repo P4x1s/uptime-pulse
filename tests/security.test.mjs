@@ -43,7 +43,7 @@ function makeCtx() {
     KV, ADMIN_TOKEN: 'Secr3t-Admin-Token', PROBE_TOKEN: 'Secr3t-Probe-Token',
     WEBHOOK_URL: 'https://alert.example.com/hook', ALERT_SIGNING_SECRET: 'Secr3t-Signing-Key',
     RESEND_API_KEY: 're_Secr3tKey', EMAIL_FROM: 'alerts@example.com',
-    PROBE_REGION: 'cf-test', MONITOR_TARGETS: '',
+    PROBE_REGION: 'cf-test', MONITORS: [],
     resolveDns: async (host) => (host === 'private.example.com' ? ['192.168.1.10'] : ['93.184.216.34']),
     fetchImpl,
   };
@@ -52,7 +52,7 @@ function makeCtx() {
   return {
     env, KV, req, webhooks, emails, outbound,
     check: () => runDueChecks(env, true),
-    setTargets: (targets) => { env.MONITOR_TARGETS = JSON.stringify(targets); },
+    setTargets: (targets) => { env.MONITORS = targets; },
     setResponder: (fn) => { responder = fn; },
   };
 }
@@ -227,10 +227,10 @@ test('输入: 后台变量字段被钳制，非法目标/邮箱被清洗或过�
   assert.equal(parsed[1].emailTo, '', '非法邮箱被丢弃');
 });
 
-test('输入: MONITOR_TARGETS 非法 JSON 或空值时安全降级为空列表', async () => {
+test('输入: 监控配置非法 JSON 或空值时安全降级为空列表', async () => {
   const ctx = makeCtx();
   for (const raw of ['', 'not-json', '{}', 'null']) {
-    ctx.env.MONITOR_TARGETS = raw;
+    ctx.env.MONITORS = raw;
     const s = await (await ctx.req('/api/status')).json();
     assert.equal(s.monitors.length, 0);
   }
