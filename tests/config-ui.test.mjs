@@ -200,3 +200,63 @@ test('UI 渲染：单分组多监控项渲染为状态条与折线图，顶部�
   assert.ok(JSON.stringify(first).includes('bars'), '应渲染历史状态条');
   assert.ok(JSON.stringify(first).includes('spark'), '应渲染响应时间折线图');
 });
+
+// ---------- 立即推送（本次：宕机/无法联通即推送） ----------
+test('ALERT_FAILURE_THRESHOLD=1 时首次失败即推送，覆盖监控项自身阈值', async () => {
+  const ctx = makeEnv({
+    MONITORS: [target({ failureThreshold: 3 })], // 监控项自身阈值 3，应被变量覆盖
+    ALERT_WEBHOOK_URL: 'https://alert.example.com/hook',
+    ALERT_FAILURE_THRESHOLD: '1',
+  });
+  ctx.env.fetchImpl = async (url, init = {}) => {
+    if (String(url).includes('alert.example.com')) {
+      ctx.webhooks.push({ url: String(url), body: JSON.parse(init.body) });
+      return new Response('', { status: 200 });
+    }
+    return new Response('', { status: 503 }); // 目标故障
+  };
+  await runDueChecks(ctx.env, true); // 仅一次检测
+  assert.equal(ctx.webhooks.length, 1, '变量阈值为 1 时首次失败即应推送，无需等 3 次');
+  assert.equal(ctx.webhooks[0].body.type, 'firing');
+  const state = await ctx.KV.get('incident:m1', 'json');
+  assert.equal(state.state, 'firing');
+});
+
+test('未设置 ALERT_FAILURE_THRESHOLD 时沿用监控项阈值，保持原行为', async () => {
+  const ctx = makeEnv({
+    MONITORS: [target({ failureThreshold: 3 })],
+    ALERT_WEBHOOK_URL: 'https://alert.example.com/hook',
+  });
+  ctx.env.fetchImpl = async (url, init = {}) => {
+    if (String(url).includes('alert.example.com')) {
+      ctx.webhooks.push({ url: String(url), body: JSON.parse(init.body) });
+      return new Response('', { status: 200 });
+    }
+    return new Response('', { status: 503 });
+  };
+  await runDueChecks(ctx.env, true); // 第 1 次失败
+  assert.equal(ctx.webhooks.length, 0, '未设变量时不应首次就推送');
+});
+
+test('Webhook 地址原样保留查询参数（ntfy 预设文案不被破坏）', async () => {
+  const ntfy = 'https://ntfy.588816.xyz/731a92d577eef1467d69ae13f4f1633441edf9e275c9555083cd648707825c04.send?text=【服务监测】&desp=监测服务出现故障！';
+  const ctx = makeEnv({
+    MONITORS: [target({ failureThreshold: 1 })],
+    ALERT_WEBHOOK_URL: ntfy,
+    ALERT_FAILURE_THRESHOLD: '1',
+    resolveDns: async () => ['93.184.216.34'],
+  });
+  let delivered = null;
+  ctx.env.fetchImpl = async (url, init = {}) => {
+    if (String(url).includes('ntfy.588816.xyz')) {
+      delivered = { url: String(url), method: init.method, body: init.body };
+      return new Response('', { status: 200 });
+    }
+    return new Response('', { status: 503 }); // 目标故障
+  };
+  await runDueChecks(ctx.env, true);
+  assert.ok(delivered, '应向 ntfy 地址投递告警');
+  assert.ok(delivered.url.includes('text=') && delivered.url.includes('desp='), '预设查询参数应保留');
+  assert.ok(decodeURIComponent(delivered.url).includes('【服务监测】'), '预设文案应原样保留（URL 编码后等价）');
+  assert.equal(delivered.method, 'POST');
+});

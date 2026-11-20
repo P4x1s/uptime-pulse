@@ -280,7 +280,9 @@ async function applyIncident(monitor, record, env) {
   let state = await getJson(env.KV, key, {
     state: 'ok', consecutiveFailures: 0, incidentId: null, lastAlertAt: 0, lastSignature: null,
   });
-  const threshold = Math.max(1, monitor.failureThreshold || 3);
+  // Workers 变量 ALERT_FAILURE_THRESHOLD 优先；未设置时沿用监控项自身阈值（默认 3）
+  const alertCfg = resolveAlertConfig(env);
+  const threshold = alertCfg.failureThreshold ?? Math.max(1, monitor.failureThreshold || 3);
   const cooldownMs = Math.max(0, monitor.alertCooldownSec ?? 300) * 1000;
 
   if (record.ok) {

@@ -105,10 +105,17 @@ export function resolveAlertConfig(env = {}) {
   // 邮件传输（API Key + 发件人）就绪即视为通道可用；收件人可来自全局配置或单个监控项的 emailTo。
   // 显式设置 ALERT_EMAIL_ENABLED=false 可关闭整条邮件通道。
   const mailReady = !!(str(env, 'RESEND_API_KEY') && str(env, 'EMAIL_FROM'));
+  // 失败阈值：Workers 变量 ALERT_FAILURE_THRESHOLD 优先，未设置时返回 null 表示沿用监控项自身配置。
+  // 设为 1 即"检测到故障立即推送"。范围 1-20。
+  const thresholdRaw = env.ALERT_FAILURE_THRESHOLD;
+  const failureThreshold = (thresholdRaw === undefined || thresholdRaw === null || String(thresholdRaw).trim() === '')
+    ? null
+    : Math.min(20, Math.max(1, Math.round(Number(thresholdRaw) || 1)));
   return {
     webhook: { enabled: boolFlag(env, 'ALERT_WEBHOOK_ENABLED', !!webhookUrl), url: webhookUrl },
     email: { enabled: boolFlag(env, 'ALERT_EMAIL_ENABLED', mailReady), to: emailTo },
     signingSecret: str(env, 'ALERT_SIGNING_SECRET'),
     mail: { apiKey: str(env, 'RESEND_API_KEY'), from: str(env, 'EMAIL_FROM') },
+    failureThreshold,
   };
 }

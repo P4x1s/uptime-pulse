@@ -59,7 +59,8 @@
 | 变量名 | 类型 | 默认行为 | 说明 |
 |---|---|---|---|
 | `ALERT_WEBHOOK_ENABLED` | 变量 | 未设置时，填了地址即开启 | `true`/`false`（也接受 1/0、yes/no、on/off）；`false` 强制关闭 Webhook |
-| `ALERT_WEBHOOK_URL` | Secret 或变量 | 空=不发送 | Webhook 接收地址（兼容旧变量 `WEBHOOK_URL`，新变量优先） |
+| `ALERT_WEBHOOK_URL` | Secret 或变量 | 空=不发送 | Webhook 接收地址（兼容旧变量 `WEBHOOK_URL`，新变量优先）；URL 中的查询参数（如 ntfy/Server酱的 `text`/`desp` 预设文案）会原样保留 |
+| `ALERT_FAILURE_THRESHOLD` | 变量 | 未设置时沿用监控项 `failureThreshold`（默认 3） | **设为 1 = 检测到宕机/无法联通立即推送**（推荐）；1-20，对所有监控项生效，优先级高于单项配置 |
 | `ALERT_EMAIL_ENABLED` | 变量 | 未设置时，邮件传输就绪即开启 | `false` 强制关闭邮件 |
 | `ALERT_EMAIL_TO` | 变量 | 空=使用监控项上的 `emailTo` | 全局收件人（兼容旧变量 `EMAIL_TO`，新变量优先） |
 | `RESEND_API_KEY` | Secret | 空=邮件不可用 | Resend API 密钥 |
@@ -71,9 +72,23 @@
 规则：
 
 - 通知地址与开关**均从环境变量读取**，代码中没有硬编码的收件人或 Webhook 地址。
+- **宕机立即推送**：设 `ALERT_FAILURE_THRESHOLD=1` 后，某目标第一次检测失败（超时、DNS/TLS/网络错误或非期望 HTTP 状态）即推送告警，无需等待连续多次；恢复后自动发送 recovered。同错误类别 + 冷却期内去重，避免告警风暴。
+- 未设置该变量时，沿用每个监控项自己的 `failureThreshold`（默认 3），行为与旧版一致。
 - 单项监控配置可可选地写 `webhookUrl` / `emailTo` 覆盖全局地址；写 `alertEnabled: false` 可关闭该项告警。
-- 告警包含：达到 `failureThreshold` 后触发 firing、恢复后发送 recovered；同错误类别 + 冷却期内去重，避免告警风暴。
 - 若配置了 `ALERT_SIGNING_SECRET`，Webhook 请求头 `X-UptimePulse-Signature: sha256=<hex>`，接收方应验签。
+
+### ntfy / Server酱 Webhook 示例（本次线上采用）
+
+把带预设文案的完整 URL 直接填进 `ALERT_WEBHOOK_URL` 即可，查询参数会被原样保留，请求以 `POST` + JSON body 发出：
+
+```
+ALERT_WEBHOOK_ENABLED=true
+ALERT_WEBHOOK_URL=https://ntfy.588816.xyz/<your-token>.send?text=【服务监测】&desp=监测服务出现故障！
+ALERT_FAILURE_THRESHOLD=1
+ALERT_EMAIL_ENABLED=false
+```
+
+告警触发时，服务端向该地址 POST 一段 JSON（含 `type`、`monitor`、`result`、`state`、`timestamp`）；ntfy/Server酱端点读取 query 中的 `text`/`desp` 文案推送通知。若需要把具体故障信息也写进通知正文，可在 URL 的 `desp` 参数中使用各平台支持的模板变量。
 
 ## 4. 状态页 UI
 
