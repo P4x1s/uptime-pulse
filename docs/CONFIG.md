@@ -77,6 +77,7 @@
 - 未设置该变量时，沿用每个监控项自己的 `failureThreshold`（默认 3），行为与旧版一致。
 - 单项监控配置可可选地写 `webhookUrl` / `emailTo` 覆盖全局地址；写 `alertEnabled: false` 可关闭该项告警。
 - 若配置了 `ALERT_SIGNING_SECRET`，Webhook 请求头 `X-UptimePulse-Signature: sha256=<hex>`，接收方应验签。
+- **误报排查**：检测引擎出于防 SSRF 不跟随重定向。若站点未登录返回 `307` 跳登录页，或根路径（如 ntfy）返回 `401`，把该监控项的 `expectedStatus` 设为 `307`/`401` 即视为正常；否则会一直判故障。此项只影响健康判定，不影响告警通道。
 
 ### ntfy / Server酱 Webhook 示例（本次线上采用）
 

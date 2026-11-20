@@ -8,7 +8,7 @@
  * 安全原语与状态接口复用 src/demo.mjs，避免两套实现产生分歧。
  */
 import {
-  assertPublicTarget, safeEqual, hmacSign, probeOnce, getJson,
+  assertPublicTarget, safeEqual, hmacSign, probeOnce, getJson, dohResolve,
   getMonitors, clampInt, dashboardHtml, APP_CSS, APP_JS, getStatusPayload,
 } from './demo.mjs';
 import { resolveAlertConfig, buildWebhookBody } from './config.mjs';
@@ -38,7 +38,7 @@ async function postJson(env, target, body, headers) {
 }
 
 async function sendWebhook(url, payload, env) {
-  const target = await assertPublicTarget(url, env.resolveDns);
+  const target = await assertPublicTarget(url, env.resolveDns || dohResolve);
   // Server酱/Turbo（.send 或带 text/title/desp）只认 body 中的 title/desp，忽略 query；
   // 标准 Webhook（含 ntfy 原生端点）继续接收完整 JSON 告警 payload。
   const built = buildWebhookBody(url, payload);

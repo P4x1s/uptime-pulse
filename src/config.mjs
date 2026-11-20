@@ -19,7 +19,7 @@
  *   group            分组名，状态页按分组渲染卡片，默认 "Public"
  *   enabled          false 时跳过检测且不在状态页展示
  *   method           GET 或 HEAD
- *   expectedStatus   期望 HTTP 状态码，默认 200
+ *   expectedStatus   期望 HTTP 状态码，默认 200；登录跳转可设 307，受保护根路径可设 401
  *   timeoutMs        单次超时（1000-30000），默认 5000
  *   intervalSec      检测间隔（>=60），默认 60
  *   failureThreshold 连续失败多少次才触发告警（1-20），默认 3
@@ -40,7 +40,7 @@ export const MONITORS = [
     group: 'Public',
     enabled: true,
     method: 'GET',
-    expectedStatus: 200,
+    expectedStatus: 307, // 未登录时跳 /login，307 即视为站点正常（检测不跟随重定向）
     timeoutMs: 5000,
     intervalSec: 60,
     failureThreshold: 3,
@@ -116,7 +116,7 @@ export const MONITORS = [
     group: 'Public',
     enabled: true,
     method: 'GET',
-    expectedStatus: 200,
+    expectedStatus: 401, // 根路径受保护，401 即视为服务正常；告警仍走 .send 端点
     timeoutMs: 5000,
     intervalSec: 60,
     failureThreshold: 2,

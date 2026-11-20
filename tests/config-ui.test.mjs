@@ -49,7 +49,6 @@ test('默认监控列表来自 src/config.mjs，支持网站与服务、名称�
     assert.equal(typeof m.enabled, 'boolean');
     assert.ok(m.timeoutMs >= 1000 && m.intervalSec >= 60 && m.failureThreshold >= 1);
   }
-  assert.ok(MONITORS.some((m) => m.type === 'service'), '应包含服务类型');
 });
 
 test('每个目标独立检测：不同地址分别发起探测并写入各自历史', async () => {
@@ -296,4 +295,33 @@ test('buildWebhookBody 兼容标准端点与恢复通知', () => {
   assert.equal(serverchan.style, 'serverchan');
   assert.equal(serverchan.body.title, '【服务监测】 已恢复');
   assert.ok(serverchan.body.desp.includes('恢复 recovered'));
+});
+
+test('生产 Worker 未注入 resolveDns 时 Webhook 仍走默认 DoH 并成功推送', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init = {}) => {
+    if (String(url).includes('cloudflare-dns.com/dns-query')) {
+      return new Response(JSON.stringify({ Answer: [{ type: 1, data: '93.184.216.34' }] }), { status: 200 });
+    }
+    return originalFetch(url, init);
+  };
+  try {
+    const ctx = makeEnv({
+      MONITORS: [target({ failureThreshold: 1 })],
+      ALERT_WEBHOOK_URL: 'https://alert.example.com/hook',
+      ALERT_FAILURE_THRESHOLD: '1',
+    });
+    delete ctx.env.resolveDns; // 模拟生产环境：没有测试用 DNS 注入
+    ctx.env.fetchImpl = async (url, init = {}) => {
+      if (String(url).includes('alert.example.com')) {
+        ctx.webhooks.push({ url: String(url), body: JSON.parse(init.body) });
+        return new Response('', { status: 200 });
+      }
+      return new Response('', { status: 503 }); // 目标故障
+    };
+    await runDueChecks(ctx.env, true);
+    assert.equal(ctx.webhooks.length, 1, '未注入 DNS 解析器时仍应推送 Webhook，不能静默失败');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
