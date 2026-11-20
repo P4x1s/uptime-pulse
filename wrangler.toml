@@ -1,0 +1,20 @@
+# UptimePulse - Cloudflare Workers 部署配置（完整版）
+name = "uptime-pulse"
+main = "src/index.mjs"
+compatibility_date = "2026-11-20"
+
+# KV：先执行 `wrangler kv namespace create UPTIME_KV`，把 id 填入下方
+[[kv_namespaces]]
+binding = "KV"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+# 每分钟调度一次；实际检测间隔由每个监控项的 intervalSec 控制
+[triggers]
+crons = ["* * * * *"]
+
+# 生产密钥请在 Dashboard → Worker → Variables and Secrets 中设置：
+#   ADMIN_TOKEN          配置接口 Bearer 令牌
+#   ALERT_SIGNING_SECRET Webhook HMAC 签名密钥
+#   WEBHOOK_URL          全局告警 Webhook（可选）
+#   PROBE_REGION         本实例线路标识，例如 cf-sin / cf-fra
+# 注意：wrangler deploy 必须带 --keep-vars，否则会清空 Dashboard 变量

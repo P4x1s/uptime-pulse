@@ -1,0 +1,8 @@
+# 本地开发变量示例（复制为 .dev.vars 并填入真实值，切勿提交）
+ADMIN_TOKEN=change-me-admin
+PROBE_TOKEN=change-me-probe
+ALERT_SIGNING_SECRET=change-me-signing
+WEBHOOK_URL=https://your-domain.example.com/hook
+PROBE_REGION=cf-edge
+RESEND_API_KEY=
+EMAIL_FROM=
