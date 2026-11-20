@@ -36,18 +36,18 @@ npx wrangler@4 kv namespace create UPTIME_KV
 
 ### 2.3 配置告警变量（Dashboard）
 
-进入 Cloudflare Dashboard → Workers & Pages → `uptime-pulse` → Settings → Variables and Secrets。
+进入 Cloudflare Dashboard → Workers & Pages → `uptime-pulse` → Settings → Variables and Secrets。所有 Worker 变量请添加为**普通变量（plain_text）**，不要选 Secret。
 
 | 名称 | 类型 | 说明 |
 |---|---|---|
 | `ALERT_WEBHOOK_ENABLED` | 变量 | `true`/`false`；不填则"有地址就开启" |
-| `ALERT_WEBHOOK_URL` | Secret 或变量 | Webhook 地址（兼容旧 `WEBHOOK_URL`） |
+| `ALERT_WEBHOOK_URL` | 变量 | Webhook 地址（兼容旧 `WEBHOOK_URL`） |
 | `ALERT_EMAIL_ENABLED` | 变量 | `true`/`false`；不填则"邮件传输就绪即开启" |
 | `ALERT_EMAIL_TO` | 变量 | 收件人（兼容旧 `EMAIL_TO`） |
-| `RESEND_API_KEY` | Secret | 邮件 API 密钥（需要邮件告警时） |
+| `RESEND_API_KEY` | 变量 | 邮件 API 密钥（需要邮件告警时） |
 | `EMAIL_FROM` | 变量 | 已验证的发件地址 |
-| `ALERT_SIGNING_SECRET` | Secret | Webhook HMAC 签名密钥 |
-| `PROBE_TOKEN` | Secret | 探针回传令牌，与国内探针一致 |
+| `ALERT_SIGNING_SECRET` | 变量 | Webhook HMAC 签名密钥 |
+| `PROBE_TOKEN` | 变量 | 探针回传令牌，与国内探针一致 |
 | `PROBE_REGION` | 变量 | 本实例线路标识，如 `cf-sin`、`cf-fra` |
 
 > 只读版已移除 `ADMIN_TOKEN`，无需配置；即便配置也会被忽略。

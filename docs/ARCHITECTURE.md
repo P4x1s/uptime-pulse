@@ -90,7 +90,7 @@ IncidentState 关键字段：`consecutiveFailures, state(ok/warning/firing), inc
 | SSRF（监控 URL / Webhook） | 仅 http(s)；拒绝 IP 字面量、localhost、内网域名后缀、元数据地址；DoH 解析后拒绝私网 IP；禁止跟随重定向（代码配置与环境变量同样校验） |
 | XSS | 前端仅用 `textContent` / DOM API 渲染配置数据，零 `innerHTML` 拼接；严格 CSP 禁止内联脚本 |
 | 告警签名伪造 | HMAC-SHA256，接收方可验签 |
-| 敏感信息泄漏 | 密钥仅存 Worker Secret；前端与状态接口不返回任何密钥或告警邮箱 |
+| 敏感信息泄漏 | 按用户要求，Worker 变量全部以普通变量（plain_text）存放，Dashboard 中可见；前端与状态接口不返回任何密钥或告警邮箱（代价：Dashboard 可见，需控制账号权限） |
 | 逻辑漏洞（重复告警） | 状态机 + incidentId + 冷却窗口 + 错误类别归一化，单测覆盖 |
 
 ## 8. 交付阶段

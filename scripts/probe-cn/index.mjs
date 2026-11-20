@@ -6,7 +6,7 @@
  *
  * 环境变量：
  *   WORKER_URL    必填，例如 https://uptime-pulse.<account>.workers.dev
- *   PROBE_TOKEN   必填，与 Worker 的 PROBE_TOKEN secret 一致
+ *   PROBE_TOKEN   必填，与 Worker 的 PROBE_TOKEN 变量一致（普通变量，不要选 Secret）
  *   PROBE_ID      必填，例如 cn-sh-1（需与监控项中的探针 ID 一致）
  *   PROBE_REGION  可选，展示用，默认同 PROBE_ID
  *   INTERVAL_SEC  可选，默认 60，最小 30

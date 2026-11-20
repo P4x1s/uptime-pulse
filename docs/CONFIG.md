@@ -59,19 +59,20 @@
 | 变量名 | 类型 | 默认行为 | 说明 |
 |---|---|---|---|
 | `ALERT_WEBHOOK_ENABLED` | 变量 | 未设置时，填了地址即开启 | `true`/`false`（也接受 1/0、yes/no、on/off）；`false` 强制关闭 Webhook |
-| `ALERT_WEBHOOK_URL` | Secret 或变量 | 空=不发送 | Webhook 接收地址（兼容旧变量 `WEBHOOK_URL`，新变量优先）；Server酱/Turbo 风格 `.send` 或 URL 带 `text`/`title`/`desp` 时，预设文案会被提取到 JSON body 的 `title`/`desp` 中，普通 Webhook 则发送完整 JSON 告警对象 |
+| `ALERT_WEBHOOK_URL` | 变量（不要选 Secret） | 空=不发送 | Webhook 接收地址（兼容旧变量 `WEBHOOK_URL`，新变量优先）；Server酱/Turbo 风格 `.send` 或 URL 带 `text`/`title`/`desp` 时，预设文案会被提取到 JSON body 的 `title`/`desp` 中，普通 Webhook 则发送完整 JSON 告警对象 |
 | `ALERT_FAILURE_THRESHOLD` | 变量 | 未设置时沿用监控项 `failureThreshold`（默认 3） | **设为 1 = 检测到宕机/无法联通立即推送**（推荐）；1-20，对所有监控项生效，优先级高于单项配置 |
 | `ALERT_EMAIL_ENABLED` | 变量 | 未设置时，邮件传输就绪即开启 | `false` 强制关闭邮件 |
 | `ALERT_EMAIL_TO` | 变量 | 空=使用监控项上的 `emailTo` | 全局收件人（兼容旧变量 `EMAIL_TO`，新变量优先） |
-| `RESEND_API_KEY` | Secret | 空=邮件不可用 | Resend API 密钥 |
+| `RESEND_API_KEY` | 变量（不要选 Secret） | 空=邮件不可用 | Resend API 密钥 |
 | `EMAIL_FROM` | 变量 | 空=邮件不可用 | 已验证的发件地址 |
-| `ALERT_SIGNING_SECRET` | Secret | 空=不签名 | Webhook HMAC-SHA256 签名密钥 |
-| `PROBE_TOKEN` | Secret | 空=探针接口拒绝 | 探针任务领取与回传令牌 |
+| `ALERT_SIGNING_SECRET` | 变量（不要选 Secret） | 空=不签名 | Webhook HMAC-SHA256 签名密钥 |
+| `PROBE_TOKEN` | 变量（不要选 Secret） | 空=探针接口拒绝 | 探针任务领取与回传令牌 |
 | `PROBE_REGION` | 变量 | `cf-edge` | 本实例线路标识 |
 
 规则：
 
 - 通知地址与开关**均从环境变量读取**，代码中没有硬编码的收件人或 Webhook 地址。
+- **所有 Cloudflare Worker 变量都作为普通变量（plain_text）填写，不要选 Secret**：当前线上 `ALERT_WEBHOOK_ENABLED`、`ALERT_WEBHOOK_URL`、`ALERT_FAILURE_THRESHOLD`、`ALERT_EMAIL_ENABLED` 均已从 Secret 转为普通变量，Dashboard 中可直接查看和修改。Webhook URL 含访问 token，也会明文显示，请控制 Dashboard 访问权限。GitHub Actions 的 `CLOUDFLARE_API_TOKEN` 是仓库 Secret，与此互不相关。
 - **宕机立即推送**：设 `ALERT_FAILURE_THRESHOLD=1` 后，某目标第一次检测失败（超时、DNS/TLS/网络错误或非期望 HTTP 状态）即推送告警，无需等待连续多次；恢复后自动发送 recovered。同错误类别 + 冷却期内去重，避免告警风暴。
 - 未设置该变量时，沿用每个监控项自己的 `failureThreshold`（默认 3），行为与旧版一致。
 - 单项监控配置可可选地写 `webhookUrl` / `emailTo` 覆盖全局地址；写 `alertEnabled: false` 可关闭该项告警。

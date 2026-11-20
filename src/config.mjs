@@ -7,6 +7,7 @@
  *
  * 【告警地址与开关】
  *   不要写死在代码里。请在 Cloudflare Dashboard → Worker → Variables and Secrets
+ *   以普通变量（plain_text）添加，不要选 Secret（用户要求变量值不加密）。
  *   设置 ALERT_WEBHOOK_ENABLED / ALERT_WEBHOOK_URL / ALERT_EMAIL_ENABLED /
  *   ALERT_EMAIL_TO 等变量（完整说明见 docs/CONFIG.md）。
  *

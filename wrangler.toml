@@ -14,7 +14,7 @@ crons = ["* * * * *"]
 
 # 监控项在 src/config.mjs 的 MONITORS 数组中集中维护；改完重新部署即生效。
 #
-# 告警地址与开关请在 Dashboard → Worker → Variables and Secrets 设置（不要写死在代码里）：
+# 告警地址与开关请在 Dashboard → Worker → Variables and Secrets 中以普通变量（plain_text）添加，不要选 Secret（用户要求变量值不加密）：
 #   ALERT_WEBHOOK_ENABLED  Webhook 开关：true/false（未设置时，填了地址即开启）
 #   ALERT_WEBHOOK_URL      Webhook 通知地址（兼容旧变量 WEBHOOK_URL）；Server酱 .send 会自动提取 text/desp 预设文案并作为 body 的 title/desp 发送
 #   ALERT_FAILURE_THRESHOLD  失败阈值：设 1 = 检测到宕机/无法联通立即推送（推荐）；未设置则沿用监控项默认值
