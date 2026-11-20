@@ -200,3 +200,25 @@ test('多线路聚合：all 模式下任一线路失败即判为故障', async (
   assert.equal(status.recentErrors.length, 1);
   assert.equal(status.recentErrors[0].region, 'cn-sh');
 });
+
+test('混合线路（edge+external）: external 回传后立即形成完整轮次，不再因 edge 无 KV 记录而永不评估', async () => {
+  const ctx = makeCtx();
+  ctx.setTargets([target({
+    id: 'm-mixed', aggregate: 'any',
+    probes: [
+      { id: 'edge-main', type: 'edge', region: 'cf-test' },
+      { id: 'cn-1', type: 'external', region: 'cn-sh' },
+    ],
+  })]);
+  ctx.setTargetStatus(200); // edge 线路探测成功
+  const probeH = { authorization: 'Bearer probe-secret', 'content-type': 'application/json' };
+  const resp = await ctx.req('/api/ingest', {
+    method: 'POST', headers: probeH,
+    body: JSON.stringify({ monitorId: 'm-mixed', probeId: 'cn-1', region: 'cn-sh', ok: true, status: 200, latencyMs: 80 }),
+  });
+  const body = await resp.json();
+  assert.equal(body.evaluated, true, '混合线路 external 回传应能立即评估（edge 走即时补探）');
+  const history = await ctx.KV.get('history:m-mixed', 'json');
+  assert.ok(Array.isArray(history) && history.length >= 1, '应形成完整轮次并写入历史');
+  assert.equal(history[0].results.length, 2, '完整轮次应含 edge + external 两条线路结果');
+});

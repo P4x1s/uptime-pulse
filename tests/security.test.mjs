@@ -256,3 +256,75 @@ test('信息泄漏: 响应体与响应头不包含任何密钥', async () => {
   const status = await (await ctx.req('/api/status')).json();
   assert.ok(!JSON.stringify(status).includes('owner@example.com'), '状态接口不应暴露告警邮箱');
 });
+
+// ---------------- 本轮安全审计回归：SSRF / 告警可靠性 / 数据健壮性 ----------------
+test('SSRF: 拒绝 IPv6 隧道（6to4/Teredo/NAT64）内嵌内网 IPv4', async () => {
+  const dns = async () => ['93.184.216.34'];
+  const { isPrivateIp } = await import('../src/demo.mjs');
+  // 6to4 内嵌 127.0.0.1 / 10.0.0.1
+  assert.equal(isPrivateIp('2002:7f00:1::'), true, '6to4 内嵌 127.0.0.1 必须判为内网');
+  assert.equal(isPrivateIp('2002:a00:1::'), true, '6to4 内嵌 10.0.0.1 必须判为内网');
+  // NAT64 内嵌 127.0.0.1
+  assert.equal(isPrivateIp('64:ff9b::7f00:1'), true, 'NAT64 内嵌 127.0.0.1 必须判为内网');
+  // Teredo 内嵌地址
+  assert.equal(isPrivateIp('2001:0:53aa:64c:0:1234:7f00:1'), true, 'Teredo 内嵌地址必须判为内网');
+  // IPv4-mapped 写法（十进制/十六进制）
+  assert.equal(isPrivateIp('::ffff:127.0.0.1'), true);
+  assert.equal(isPrivateIp('::ffff:7f00:1'), true);
+  // 公网 IPv6 不应误判
+  assert.equal(isPrivateIp('2001:4860:4860::8888'), false, '公网 IPv6 不得误判');
+  for (const u of ['http://[2002:7f00:1::]/', 'http://[64:ff9b::7f00:1]/', 'http://[::ffff:127.0.0.1]/']) {
+    await assert.rejects(() => assertPublicTarget(u, dns), null, `应拒绝 SSRF: ${u}`);
+  }
+});
+
+test('SSRF: 拒绝整数/十六进制/八进制混淆 IP 写法', async () => {
+  const dns = async () => ['93.184.216.34'];
+  for (const u of ['http://0x7f000001/', 'http://0177.0.0.1/', 'http://2130706433/']) {
+    await assert.rejects(() => assertPublicTarget(u, dns), null, `应拒绝混淆 IP: ${u}`);
+  }
+});
+
+test('告警可靠性: Webhook HTTP 500 时不写冷却标记，下一轮立即重试', async () => {
+  const ctx = makeCtx();
+  ctx.setTargets([target({ failureThreshold: 1, alertCooldownSec: 300 })]);
+  let fail = true;
+  ctx.setResponder(() => ({ status: 503 }));
+  const origFetch = ctx.env.fetchImpl;
+  let attempts = 0;
+  ctx.env.fetchImpl = async (url, init = {}) => {
+    if (String(url).includes('alert.example.com')) {
+      attempts += 1;
+      if (fail) return new Response('', { status: 500 }); // 接收端故障
+      ctx.webhooks.push({ url: String(url), body: JSON.parse(init.body) });
+      return new Response('', { status: 200 });
+    }
+    return origFetch(url, init);
+  };
+  await ctx.check();
+  assert.equal(attempts, 1, '首次故障应尝试投递');
+  let st = await ctx.KV.get('incident:m1', 'json');
+  assert.equal(st.lastAlertAt, 0, '投递失败不应写入冷却标记');
+  assert.equal(st.lastSignature, null, '投递失败不应写入签名');
+  // 目标保持故障，Webhook 恢复可用 -> 下一轮应立即重试
+  fail = false;
+  await ctx.check();
+  assert.equal(attempts, 2, '投递失败后下一轮应立即重试，不得被冷却吞掉');
+  assert.equal(ctx.webhooks.length, 1, '重试成功应被记录');
+  st = await ctx.KV.get('incident:m1', 'json');
+  assert.ok(st.lastAlertAt > 0, '成功投递后应写入冷却标记');
+});
+
+test('健壮性: 被污染的 KV 数组/对象不会使状态接口或检测轮次崩溃', async () => {
+  const ctx = makeCtx();
+  ctx.setTargets([target()]);
+  // 故意写入非法类型
+  await ctx.KV.put('history:m1', '"not-an-array"');
+  await ctx.KV.put('events:m1', '123');
+  await ctx.KV.put('incident:m1', '"corrupted"');
+  const status = await (await ctx.req('/api/status')).json();
+  assert.equal(status.monitors.length, 1, '状态接口应正常返回而非 500');
+  await ctx.check();
+  const history = await ctx.KV.get('history:m1', 'json');
+  assert.ok(Array.isArray(history), '检测轮次应把污染数据修复为数组');
+});

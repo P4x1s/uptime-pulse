@@ -56,22 +56,63 @@ function safeEqual(a, b) {
   return diff === 0;
 }
 
-/** 判断 IP 是否属于私网 / 保留地址（含 IPv4-mapped IPv6 的十进制与十六进制写法） */
+/** 将 32 位整数还原为点分十进制 IPv4 */
+function u32ToIp(n) {
+  return `${(n >>> 24) & 255}.${(n >>> 16) & 255}.${(n >>> 8) & 255}.${n & 255}`;
+}
+
+/**
+ * 判断 IP 是否属于私网 / 保留地址。
+ * 覆盖：点分十进制、IPv4-mapped IPv6、6to4(2002::/16)、Teredo(2001::/32)、
+ *       NAT64(64:ff9b::/96) 内嵌 IPv4，以及本地/链路本地/ULA 等保留前缀。
+ */
 function isPrivateIp(input) {
   let ip = String(input).toLowerCase().trim().replace(/^\[/, '').replace(/\]$/, '');
+  if (!ip || ip.length > 128) return true;
+
+  // IPv4-mapped IPv6：::ffff:a.b.c.d 或 ::ffff:xxxx:xxxx（含省略形式）
   if (ip.startsWith('::ffff:')) {
     const rest = ip.slice(7);
-    const parts = rest.split(':');
-    if (parts.length === 2 && !rest.includes('.')) {
-      const hi = parseInt(parts[0], 16), lo = parseInt(parts[1], 16);
-      if (Number.isFinite(hi) && Number.isFinite(lo)) {
-        return isPrivateIp(`${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`);
-      }
+    const dotted = rest.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (dotted) return isPrivateIp(rest);
+    const hex = rest.split(':').filter(Boolean);
+    if (hex.length === 1 && /^[0-9a-f]{1,8}$/.test(hex[0])) {
+      return isPrivateIp(u32ToIp(parseInt(hex[0], 16) >>> 0));
     }
-    return isPrivateIp(rest);
+    if (hex.length === 2 && /^[0-9a-f]{1,4}$/.test(hex[0]) && /^[0-9a-f]{1,4}$/.test(hex[1])) {
+      return isPrivateIp(u32ToIp(((parseInt(hex[0], 16) << 16) | parseInt(hex[1], 16)) >>> 0));
+    }
+    return true; // 无法解析的映射地址一律拒绝
   }
+
+  // IPv6 隧道内嵌 IPv4：这些前缀专线用于穿越 NAT，绝不应作为监控目标
+  // 6to4  2002:WWXX:YYZZ::  -> W.X.Y.Z（WW/XX/YY/ZZ 为 8 位十六进制组）
+  const sixtofour = ip.match(/^2002:([0-9a-f]{1,4}):([0-9a-f]{1,4})(?::|$)/);
+  if (sixtofour) {
+    const hi = parseInt(sixtofour[1], 16), lo = parseInt(sixtofour[2], 16);
+    return isPrivateIp(u32ToIp(((hi << 16) | lo) >>> 0));
+  }
+  // Teredo 2001:0000::/32：客户端 IPv4 在末 32 位（按位取反）
+  if (/^2001:0(?::|:0)/.test(ip)) {
+    const groups = ip.split(':');
+    const tail = groups.slice(-2);
+    if (tail.length === 2 && tail.every((g) => /^[0-9a-f]{1,4}$/.test(g))) {
+      const raw = ((parseInt(tail[0], 16) << 16) | parseInt(tail[1], 16)) >>> 0;
+      return isPrivateIp(u32ToIp((~raw) >>> 0)) || isPrivateIp(u32ToIp(raw));
+    }
+    return true;
+  }
+  // NAT64 64:ff9b::/96：IPv4 在末 32 位
+  const nat64 = ip.match(/^64:ff9b:(?::)*([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  if (nat64) {
+    const hi = parseInt(nat64[1], 16), lo = parseInt(nat64[2], 16);
+    return isPrivateIp(u32ToIp(((hi << 16) | lo) >>> 0));
+  }
+
+  // 点分十进制 IPv4；拒绝含前导零的段（八进制混淆写法）
   const v4 = ip.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
   if (v4) {
+    if (v4.slice(1).some((seg) => seg.length > 1 && seg[0] === '0')) return true;
     const a = Number(v4[1]), b = Number(v4[2]);
     if (a === 0 || a === 10 || a === 127 || a >= 224) return true;
     if (a === 172 && b >= 16 && b <= 31) return true;
@@ -113,7 +154,10 @@ async function assertPublicTarget(raw, resolveDns) {
   if (u.username || u.password) throw new Error('URL 不允许包含凭据');
   const host = u.hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
   if (!host) throw new Error('缺少主机名');
-  if (/^[0-9]+$/.test(host) || /^0x[0-9a-f]+$/i.test(host)) throw new Error('禁止使用混淆 IP 写法');
+  // 拒绝整数/十六进制/八进制等混淆 IP 写法（WHATWG URL 会规范化部分形式，这里兜底）
+  if (/^0[xX][0-9a-f]+$/.test(host) || /^0[oO][0-7]+$/.test(host)) throw new Error('禁止使用混淆 IP 写法');
+  if (/^0[0-7]+$/.test(host)) throw new Error('禁止使用混淆 IP 写法');
+  if (/^\d+$/.test(host)) throw new Error('禁止使用整数 IP 写法');
   if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(':')) {
     if (isPrivateIp(host)) throw new Error('目标 IP 属于内网/保留地址');
     return u;
@@ -125,6 +169,18 @@ async function assertPublicTarget(raw, resolveDns) {
   if (!ips.length) throw new Error('域名无解析记录');
   if (ips.some(isPrivateIp)) throw new Error('域名解析到内网/保留地址');
   return u;
+}
+
+/** KV 数据健壮性：被污染的非数组/非对象一律回退为空值，避免 unshift/filter 抛错 */
+function asArray(v) { return Array.isArray(v) ? v : []; }
+function asObject(v) { return v && typeof v === 'object' && !Array.isArray(v) ? v : {}; }
+
+/** 告警状态机默认结构（每次返回新对象，避免共享可变引用） */
+function defaultIncident() {
+  return {
+    state: 'ok', consecutiveFailures: 0, incidentId: null, lastAlertAt: 0, lastSignature: null,
+    totalChecks: 0, upChecks: 0, downChecks: 0, outageStart: 0,
+  };
 }
 
 async function hmacSign(payload, secret) {
@@ -411,13 +467,14 @@ async function sendWebhook(monitor, type, record, state, env) {
   const secret = cfg.signingSecret;
   const headers = { 'content-type': 'application/json', 'user-agent': 'UptimePulse/2.0 (+alert)' };
   if (secret) headers['x-uptimepulse-signature'] = `sha256=${await hmacSign(body, secret)}`;
-  await (env.fetchImpl || fetch)(target.toString(), { method: 'POST', headers, body });
+  const resp = await (env.fetchImpl || fetch)(target.toString(), { method: 'POST', headers, body });
+  if (!resp.ok) throw new Error(`Webhook HTTP ${resp.status}`);
 }
 
 /** 写入一条故障事件（开始或恢复），保留最近 MAX_EVENTS 条 */
 async function recordEvent(env, monitorId, event) {
   const key = `events:${monitorId}`;
-  const events = await getJson(env.KV, key, []);
+  const events = asArray(await getJson(env.KV, key, []));
   events.unshift(event);
   if (events.length > MAX_EVENTS) events.length = MAX_EVENTS;
   await env.KV.put(key, JSON.stringify(events));
@@ -426,15 +483,14 @@ async function recordEvent(env, monitorId, event) {
 /** @returns {Promise<IncidentState>} */
 async function applyIncident(monitor, record, env) {
   const key = `incident:${monitor.id}`;
-  let state = await getJson(env.KV, key, {
-    state: 'ok', consecutiveFailures: 0, incidentId: null, lastAlertAt: 0, lastSignature: null,
-    totalChecks: 0, upChecks: 0, downChecks: 0, outageStart: 0,
-  });
+  let state = { ...defaultIncident(), ...asObject(await getJson(env.KV, key, {})) };
   // 兼容旧状态：累计计数缺失时按 0 初始化
   state.totalChecks = Number(state.totalChecks) || 0;
   state.upChecks = Number(state.upChecks) || 0;
   state.downChecks = Number(state.downChecks) || 0;
   state.outageStart = Number(state.outageStart) || 0;
+  state.consecutiveFailures = Number(state.consecutiveFailures) || 0;
+  state.lastAlertAt = Number(state.lastAlertAt) || 0;
   // Workers 变量 ALERT_FAILURE_THRESHOLD 优先；未设置时沿用监控项自身阈值（默认 3）
   const alertCfg = resolveAlertConfig(env);
   const threshold = alertCfg.failureThreshold ?? Math.max(1, monitor.failureThreshold || 3);
@@ -492,7 +548,7 @@ async function applyIncident(monitor, record, env) {
 async function runCheck(env, monitor) {
   const record = await probeOnce(monitor, env);
   const state = await applyIncident(monitor, record, env);
-  const history = await getJson(env.KV, `history:${monitor.id}`, []);
+  const history = asArray(await getJson(env.KV, `history:${monitor.id}`, []));
   history.unshift({ ...record, incidentState: state.state });
   if (history.length > MAX_HISTORY) history.length = MAX_HISTORY;
   await env.KV.put(`history:${monitor.id}`, JSON.stringify(history));
@@ -550,9 +606,9 @@ async function getStatusPayload(env) {
   // 并行读取每个目标的历史 / 事件，减少 KV 往返
   const snapshots = await Promise.all(enabled.map(async (m) => ({
     m,
-    history: await getJson(env.KV, `history:${m.id}`, []),
-    incident: await getJson(env.KV, `incident:${m.id}`, { state: 'ok', consecutiveFailures: 0 }),
-    events: await getJson(env.KV, `events:${m.id}`, []),
+    history: asArray(await getJson(env.KV, `history:${m.id}`, [])),
+    incident: asObject(await getJson(env.KV, `incident:${m.id}`, { state: 'ok', consecutiveFailures: 0 })),
+    events: asArray(await getJson(env.KV, `events:${m.id}`, [])),
   })));
 
   const out = [], recentErrors = [], allEvents = [];
@@ -582,9 +638,10 @@ async function getStatusPayload(env) {
         ? lastPoint.results.filter((r) => !r.ok)
         : [lastPoint];
       for (const r of failed) {
+        // 公开接口只暴露稳定错误分类，不回传原始异常文本（可能含内部主机/IP/TLS 细节）
         recentErrors.push({
           checkedAt: lastPoint.checkedAt, monitorName: m.name || m.url,
-          region: r.region, status: r.status, error: r.error,
+          region: r.region, status: r.status, errorClass: r.errorClass || errorClass(r.error),
         });
       }
     }
@@ -742,7 +799,9 @@ export function createWorker(env) {
     if (path === '/app.css' && request.method === 'GET') return text(APP_CSS, 200, 'text/css; charset=utf-8');
     if (path === '/app.js' && request.method === 'GET') return text(APP_JS, 200, 'application/javascript; charset=utf-8');
 
-    if (path === '/api/status' && request.method === 'GET') return json(await getStatusPayload(env));
+    if (path === '/api/status' && request.method === 'GET') {
+      return json(await getStatusPayload(env), 200, { 'Cache-Control': 'no-store, max-age=0' });
+    }
 
     // 只读模式：任何修改监控配置的接口一律禁用
     if (path === '/api/monitors' || path.startsWith('/api/monitors/') || path === '/api/check') {
@@ -757,7 +816,7 @@ export function createWorker(env) {
 }
 
 export {
-  isPrivateIp, safeEqual, assertPublicTarget, hmacSign, dohResolve, getJson,
+  isPrivateIp, safeEqual, assertPublicTarget, hmacSign, dohResolve, getJson, asArray, asObject, defaultIncident,
   getMonitors, parseTargets, clampInt, normalizeProbes, normalizeCodes, normalizeHeaders,
   probeOnce, errorClass, isRetryable, applyIncident, recordEvent, runCheck, runDueChecks,
   dashboardHtml, APP_CSS, APP_JS, getStatusPayload, historyPoint, windowUptime,

@@ -415,7 +415,7 @@ test('状态接口返回 24h 可用率、当前延迟、错误分类、事件历
   const data = await (await ctx.worker.fetch(new Request('http://localhost/api/status'))).json();
   const m = data.monitors[0];
   assert.equal(m.state, 'firing');
-  assert.equal(m.latencyMs, 0);
+  assert.ok(Number.isInteger(m.latencyMs) && m.latencyMs >= 0, '延迟应为非负整数');
   assert.equal(typeof m.uptime24h, 'number', '应返回 24h 可用率');
   assert.equal(typeof m.uptime, 'number');
   assert.ok(m.errorClass, '应有错误分类');

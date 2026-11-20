@@ -13,6 +13,7 @@
 import {
   assertPublicTarget, safeEqual, hmacSign, probeOnce, getJson, dohResolve, clampInt,
   getMonitors, dashboardHtml, APP_CSS, APP_JS, getStatusPayload, errorClass, recordEvent,
+  asArray, asObject, defaultIncident,
 } from './demo.mjs';
 import { resolveAlertConfig, buildWebhookBody } from './config.mjs';
 
@@ -48,7 +49,9 @@ async function sendWebhook(url, payload, env) {
   const body = JSON.stringify(built.body);
   const headers = { 'user-agent': 'UptimePulse/2.0 (+alert)' };
   if (env.ALERT_SIGNING_SECRET) headers['x-uptimepulse-signature'] = `sha256=${await hmacSign(body, env.ALERT_SIGNING_SECRET)}`;
-  await postJson(env, target.toString(), body, headers);
+  const resp = await postJson(env, target.toString(), body, headers);
+  if (!resp.ok) throw new Error(`Webhook HTTP ${resp.status}`);
+  return true;
 }
 
 async function sendEmail(to, payload, env) {
@@ -68,14 +71,19 @@ async function sendEmail(to, payload, env) {
     `连续失败: ${payload.state.consecutiveFailures}`,
     payload.result.error ? `错误: ${payload.result.error}` : '',
   ].filter(Boolean);
-  await postJson(env, 'https://api.resend.com/emails', JSON.stringify({
+  const resp = await postJson(env, 'https://api.resend.com/emails', JSON.stringify({
     from: cfg.mail.from, to: [to], subject, text: lines.join('\n'),
   }), { authorization: `Bearer ${cfg.mail.apiKey}` });
+  if (!resp.ok) throw new Error(`邮件 HTTP ${resp.status}`);
+  return true;
 }
 
-/** 告警地址与开关来自 env（ALERT_*）；监控项可选覆盖，但 alertEnabled:false 可整体关闭该项告警 */
+/**
+ * 告警地址与开关来自 env（ALERT_*）；监控项可选覆盖，但 alertEnabled:false 可整体关闭该项告警。
+ * @returns {Promise<number>} 成功投递的通道数（0 表示全部失败，调用方不应写入冷却标记）
+ */
 async function dispatchAlerts(monitor, type, aggregated, state, env) {
-  if (monitor.alertEnabled === false) return;
+  if (monitor.alertEnabled === false) return 0;
   const cfg = resolveAlertConfig(env);
   const payload = {
     type,
@@ -87,13 +95,18 @@ async function dispatchAlerts(monitor, type, aggregated, state, env) {
   const jobs = [];
   const webhookUrl = monitor.webhookUrl || cfg.webhook.url;
   if (cfg.webhook.enabled && webhookUrl) {
-    jobs.push(sendWebhook(webhookUrl, payload, env).catch((e) => console.error('Webhook 告警失败', e)));
+    jobs.push(sendWebhook(webhookUrl, payload, env).then(() => true).catch((e) => {
+      console.error('Webhook 告警失败', e); return false;
+    }));
   }
   const emailTo = monitor.emailTo || cfg.email.to;
   if (cfg.email.enabled && emailTo) {
-    jobs.push(sendEmail(emailTo, payload, env).catch((e) => console.error('邮件告警失败', e)));
+    jobs.push(sendEmail(emailTo, payload, env).then(() => true).catch((e) => {
+      console.error('邮件告警失败', e); return false;
+    }));
   }
-  await Promise.allSettled(jobs);
+  const results = await Promise.all(jobs);
+  return results.filter(Boolean).length;
 }
 
 // ---------- 状态机与聚合 ----------
@@ -116,14 +129,13 @@ function aggregateResults(results, mode) {
 
 async function applyIncident(monitor, aggregated, env) {
   const key = `incident:${monitor.id}`;
-  let state = await getJson(env.KV, key, {
-    state: 'ok', consecutiveFailures: 0, incidentId: null, lastAlertAt: 0, lastSignature: null,
-    totalChecks: 0, upChecks: 0, downChecks: 0, outageStart: 0,
-  });
+  let state = { ...defaultIncident(), ...asObject(await getJson(env.KV, key, {})) };
   state.totalChecks = Number(state.totalChecks) || 0;
   state.upChecks = Number(state.upChecks) || 0;
   state.downChecks = Number(state.downChecks) || 0;
   state.outageStart = Number(state.outageStart) || 0;
+  state.consecutiveFailures = Number(state.consecutiveFailures) || 0;
+  state.lastAlertAt = Number(state.lastAlertAt) || 0;
   // Workers 变量 ALERT_FAILURE_THRESHOLD 优先；未设置时沿用监控项自身阈值（默认 3）
   const alertCfg = resolveAlertConfig(env);
   const threshold = alertCfg.failureThreshold ?? Math.max(1, monitor.failureThreshold || 3);
@@ -163,9 +175,13 @@ async function applyIncident(monitor, aggregated, env) {
       const signature = `${aggregated.status}:${aggregated.errorClass || errorClass(aggregated.error)}`;
       const shouldNotify = signature !== state.lastSignature || now - state.lastAlertAt >= cooldownMs;
       if (shouldNotify) {
-        await dispatchAlerts(monitor, 'firing', aggregated, state, env);
-        state.lastAlertAt = now;
-        state.lastSignature = signature;
+        const delivered = await dispatchAlerts(monitor, 'firing', aggregated, state, env);
+        // 只有至少一路成功投递才写入冷却标记；全部失败时保留旧标记，下一轮可立即重试，
+        // 避免"发送失败却被当成已通知"导致故障告警永久丢失。
+        if (delivered > 0) {
+          state.lastAlertAt = now;
+          state.lastSignature = signature;
+        }
       }
     }
   }
@@ -176,7 +192,7 @@ async function applyIncident(monitor, aggregated, env) {
 async function commitRound(monitor, results, env) {
   const aggregated = aggregateResults(results, monitor.aggregate);
   const state = await applyIncident(monitor, aggregated, env);
-  const history = await getJson(env.KV, `history:${monitor.id}`, []);
+  const history = asArray(await getJson(env.KV, `history:${monitor.id}`, []));
   history.unshift({ checkedAt: new Date().toISOString(), ...aggregated, results, incidentState: state.state });
   if (history.length > MAX_HISTORY) history.length = MAX_HISTORY;
   await env.KV.put(`history:${monitor.id}`, JSON.stringify(history));
@@ -200,9 +216,9 @@ async function runDueChecks(env, force = false) {
       if (probe.type === 'edge') {
         results.push(await probeOnce(m, env));
       } else {
-        const report = await getJson(env.KV, `probe:${m.id}:${probe.id}`, null);
+        const report = asObject(await getJson(env.KV, `probe:${m.id}:${probe.id}`, null));
         const freshMs = Math.max(120, m.intervalSec * 3) * 1000;
-        if (report && now - report.receivedAt <= freshMs) {
+        if (report.receivedAt && now - report.receivedAt <= freshMs) {
           results.push({ ...report, errorClass: report.errorClass || errorClass(report.error), attempts: report.attempts || 1 });
         } else {
           results.push({
@@ -237,7 +253,9 @@ export function createWorker(env) {
     if (path === '/app.css' && method === 'GET') return text(APP_CSS, 200, 'text/css; charset=utf-8');
     if (path === '/app.js' && method === 'GET') return text(APP_JS, 200, 'application/javascript; charset=utf-8');
 
-    if (path === '/api/status' && method === 'GET') return json(await getStatusPayload(env));
+    if (path === '/api/status' && method === 'GET') {
+      return json(await getStatusPayload(env), 200, { 'Cache-Control': 'no-store, max-age=0' });
+    }
 
     // 只读模式：任何修改监控配置的接口一律禁用（含历史接口，避免暴露内部数据）
     if (path === '/api/monitors' || path.startsWith('/api/monitors/') || path === '/api/check'
@@ -286,15 +304,19 @@ export function createWorker(env) {
         receivedAt: Date.now(),
       };
       await env.KV.put(`probe:${id}:${probeId}`, JSON.stringify(report));
-      // 仅当所有线路都有新鲜结果时才形成一个完整轮次，避免历史样本失真
+      // 仅当所有线路都有新鲜结果时才形成一个完整轮次，避免历史样本失真。
+      // 注意：edge 线路的探测结果从不写入 probe:* KV（由 scheduled 即时探测），
+      // 因此这里对 edge 线路即时补探，否则 edge+external 混合配置将永远 allFresh=false。
       const results = [];
       const freshMs = Math.max(120, monitor.intervalSec * 3) * 1000;
       let allFresh = true;
       for (const p of monitor.probes || []) {
         if (p.id === probeId) { results.push(report); continue; }
-        const r = await getJson(env.KV, `probe:${id}:${p.id}`, null);
-        if (r && Date.now() - r.receivedAt <= freshMs) results.push(r);
-        else allFresh = false;
+        if (p.type === 'edge') { results.push(await probeOnce(monitor, env)); continue; }
+        const r = asObject(await getJson(env.KV, `probe:${id}:${p.id}`, null));
+        if (r.receivedAt && Date.now() - r.receivedAt <= freshMs) {
+          results.push({ ...r, errorClass: r.errorClass || errorClass(r.error), attempts: r.attempts || 1 });
+        } else allFresh = false;
       }
       if (allFresh) {
         const evaluated = await commitRound(monitor, results, env);
