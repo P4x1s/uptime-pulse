@@ -1,6 +1,6 @@
 # UptimePulse - Cloudflare Workers 部署配置（完整版）
 name = "uptime-pulse"
-main = "src/index.mjs"
+main = "workers.js"
 compatibility_date = "2026-11-20"
 
 # KV：先执行 `wrangler kv namespace create UPTIME_KV`，把 id 填入下方
@@ -12,7 +12,7 @@ id = "3fecb5a52a024f3da729b4f1a9867036"
 [triggers]
 crons = ["* * * * *"]
 
-# 监控项在 src/config.mjs 的 MONITORS 数组中集中维护；改完重新部署即生效。
+# 监控项在 workers.js 顶部的 MONITORS 数组中集中维护；改完重新部署即生效。
 #
 # 告警地址与开关请在 Dashboard → Worker → Variables and Secrets 中以普通变量（plain_text）添加，不要选 Secret（用户要求变量值不加密）：
 #   ALERT_WEBHOOK_ENABLED  Webhook 开关：true/false（未设置时，填了地址即开启）

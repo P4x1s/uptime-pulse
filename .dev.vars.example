@@ -14,6 +14,6 @@ ALERT_EMAIL_TO=you@example.com
 RESEND_API_KEY=
 EMAIL_FROM=
 
-# 监控目标默认来自 src/config.mjs 的 MONITORS 数组。
+# 监控目标默认来自 workers.js 的 MONITORS 数组。
 # 本地调试可用 MONITORS_JSON 临时覆盖（JSON 数组）；留空则使用代码内配置。
 MONITORS_JSON=

@@ -1,110 +1,68 @@
 # UptimePulse
 
-轻量网站 / 服务可用性监控。源码托管 GitHub，运行时部署在 Cloudflare Workers；支持国内外多线路、邮件与 Webhook 告警、失败阈值、告警去重与恢复通知。
+轻量网站 / 服务可用性监控。整个项目只有一个 Worker 文件 `workers.js`，运行在 Cloudflare Workers；支持多线路、Webhook 与邮件告警、失败阈值、告警去重与恢复通知。
 
-> **只读模式**：监控目标在源码 `src/config.mjs` 的 `MONITORS` 数组中集中维护；告警地址与开关在 Cloudflare 后台变量中配置。公开页面为纯只读展示，**不提供任何新增/编辑/删除监控项的前端入口或接口**。
+> **只读模式**：监控目标在 `workers.js` 顶部的 `MONITORS` 数组中集中维护；告警地址与开关在 Cloudflare 后台变量中配置。公开页面为纯只读展示，**不提供任何新增/编辑/删除监控项的前端入口或接口**。
 
-## 特性
-
-- 代码内集中配置：一个数组管理所有网站与服务，支持名称、地址、类型、启用状态与检测参数
-- 目标独立检测：每个监控项独立调度、独立历史、独立告警状态机；到期项并行探测，缩短 Cron 耗时
-- 多线路检测：Cloudflare 边缘线路（国外）+ 自托管探针（国内），判定规则两端一致
-- 检测维度（参考 UptimeFlare 设计）：
-  - 多期望状态码 `expectedCodes`（任一命中即正常，优先于 `expectedStatus`）
-  - 响应体关键字正反匹配 `responseKeyword` / `responseForbiddenKeyword`（只读前 64KB）
-  - 自定义请求方法与头/体（POST/PUT/...、`headers`、`body`，自动过滤危险逐跳头）
-  - 瞬时故障重试 `retries`（超时/DNS/TLS/网络类，指数退避；确定性状态码故障不重试）
-  - 稳定错误分类（status / keyword / timeout / dns / tls / network），避免告警风暴
-- 状态记录：累计 up/down 计数 + 故障事件历史（起止时间、持续时长、原因、恢复状态）
-- 状态页：顶部徽章 + 统计摘要（在线数/24h 可用率）+ 分组卡片 + 状态条 + 响应时间折线图
-  - 时间区间切换（24 小时 / 7 天 / 全部）、当前延迟、连续失败、工具提示
-  - 浅色/深色主题（跟随系统 + 手动切换并记忆）、响应式布局、手动刷新、无障碍标签
-- 告警：Webhook（HMAC 签名）、邮件（Resend），地址与开关均可配置，含恢复通知、失败阈值、冷却去重
-- 安全：仅探针回传保留令牌、SSRF 防护、严格 CSP、零 `innerHTML` 用户渲染、写接口全部禁用
-
-## 目录
+## 文件结构
 
 ```
-src/config.mjs         监控项集中配置（MONITORS）+ 告警变量解析
-src/demo.mjs           核心库（SSRF/检测/告警）+ 截图风格只读页面
-src/index.mjs          完整版 Worker（多线路 + 邮件 + 探针回传）
-scripts/dev-server.mjs 本地开发服务器（Node，无第三方依赖）
-scripts/probe-cn/      国内自托管探针（Node，无第三方依赖）
-tests/                 demo / 功能 / 安全 / 配置与 UI 四套测试，共 45 项
-docs/CONFIG.md         配置项与变量完整说明（先看这个）
-docs/                  架构、部署、安全测试报告
+workers.js          唯一的 Worker 源码：MONITORS 配置 + 检测/告警/状态页全部逻辑
+wrangler.toml       Cloudflare 部署配置（KV 绑定、Cron、变量说明）
+package.json        仅含 deploy 脚本，无第三方依赖
+.dev.vars.example   本地开发变量示例（复制为 .dev.vars 使用，勿提交）
 ```
 
-## 配置监控目标
+## 如何增删监控地址
 
-编辑 `src/config.mjs` 的 `MONITORS` 数组，然后重新部署：
+全部在 `workers.js` 的 `MONITORS` 数组中维护，改完部署即生效（在 Cloudflare Dashboard 编辑器中直接修改后点 Deploy，或本地 `npx wrangler deploy --keep-vars`）：
+
+- **添加**：复制一个 `{ ... }` 对象，改掉 `id` / `name` / `url`
+- **删除**：删掉对应的 `{ ... }` 对象（注意保留对象之间的逗号）
+- **临时停用**：把该项的 `enabled` 改为 `false`
+
+常用字段：
 
 ```js
-export const MONITORS = [
-  {
-    id: 'my-website',
-    name: 'My Personal Website',
-    url: 'https://example.com',
-    type: 'website',       // website | api | service
-    group: 'Public',
-    enabled: true,
-    method: 'GET',             // GET/HEAD/POST/PUT/PATCH/DELETE/OPTIONS
-    expectedStatus: 200,       // 单期望状态码（未填 expectedCodes 时生效）
-    // —— 进阶检测字段（可选）——
-    // expectedCodes: [200, 201],            // 多个可接受状态码，优先于 expectedStatus
-    // responseKeyword: '"ok":true',         // 响应体必须包含（只读前 64KB）
-    // responseForbiddenKeyword: 'error',    // 响应体不得包含
-    // headers: { 'X-Api-Key': 'xxx' },      // 自定义请求头（危险逐跳头自动过滤）
-    // body: '{"ping":1}',                   // 自定义请求体（GET/HEAD 忽略）
-    // retries: 1,                           // 瞬时网络故障重试次数 0-3（指数退避）
-    // tooltip: '首页健康检查', statusPageLink: 'https://example.com', hideLatencyChart: false,
-    timeoutMs: 5000,
-    intervalSec: 60,
-    failureThreshold: 3,
-    alertCooldownSec: 300,
-    aggregate: 'any',      // any | all
-    probes: [{ id: 'edge-main', type: 'edge', region: 'cf-edge' }],
-  },
-  // 继续添加更多网站或服务……
-];
+{
+  id: 'my-website',
+  name: 'My Personal Website',
+  url: 'https://example.com',
+  type: 'website',       // website | api | service（分类展示用）
+  group: 'Public',
+  enabled: true,
+  expectedStatus: 200,   // 期望状态码（登录跳转可设 307，受保护路径可设 401）
+  timeoutMs: 5000,
+  intervalSec: 60,       // 检测间隔（>=60）
+  failureThreshold: 3,   // 连续失败 N 次才告警
+  aggregate: 'any',      // any=任一线路成功即正常 | all=全部成功才正常
+  probes: [{ id: 'edge-main', type: 'edge', region: 'cf-edge' }],
+}
 ```
 
-判定规则：状态码落入 `expectedCodes` 集合（默认由 `expectedStatus` 决定）+ 满足关键字正反匹配才算成功；只有超时/DNS/TLS/网络类瞬时故障才按 `retries` 重试。新增、删除、修改对象即可；`enabled: false` 可临时停用某项。完整字段说明见 `docs/CONFIG.md`。
+进阶字段（可选）：`expectedCodes`（多状态码）、`responseKeyword` / `responseForbiddenKeyword`（响应体关键字正反匹配）、`method` / `headers` / `body`（自定义请求）、`retries`（瞬时故障重试 0-3）、`tooltip`、`statusPageLink`、`hideLatencyChart`。完整字段说明见 `workers.js` 内注释。
 
-告警地址与开关**不要写在代码里**，在 Cloudflare Dashboard 设置：
+## 告警通知
+
+告警地址与开关**不写在代码里**，在 Cloudflare Dashboard → Worker → Variables and Secrets 以普通变量（plain_text）配置（完整说明见 `wrangler.toml` 注释）：
 
 | 变量 | 作用 |
 |---|---|
-| `ALERT_WEBHOOK_ENABLED` / `ALERT_WEBHOOK_URL` | Webhook 开关与地址 |
+| `ALERT_WEBHOOK_ENABLED` / `ALERT_WEBHOOK_URL` | Webhook 开关与地址（兼容 ntfy / Server酱） |
+| `ALERT_FAILURE_THRESHOLD` | 全局失败阈值，设 `1` = 检测到故障立即推送 |
 | `ALERT_EMAIL_ENABLED` / `ALERT_EMAIL_TO` | 邮件开关与收件人 |
-| `RESEND_API_KEY` / `EMAIL_FROM` | 邮件传输 |
-| `ALERT_SIGNING_SECRET` | Webhook 验签 |
-| `PROBE_TOKEN` / `PROBE_REGION` | 国内探针 |
+| `RESEND_API_KEY` / `EMAIL_FROM` | 邮件传输（Resend） |
+| `ALERT_SIGNING_SECRET` | Webhook HMAC 验签 |
+| `PROBE_TOKEN` / `PROBE_REGION` | 国内自托管探针回传 |
 
-## 本地快速开始
+## 特性
 
-要求 Node.js >= 20（本机使用 22）。无需安装依赖。
-
-```bash
-# 默认读取 src/config.mjs 的 MONITORS
-node scripts/dev-server.mjs --worker=src/index.mjs
-
-# 也可用 MONITORS_JSON 临时覆盖（仅本地调试）
-MONITORS_JSON='[{"id":"t","name":"测试","url":"https://example.com"}]' \
-  node scripts/dev-server.mjs --worker=src/index.mjs
-
-# 浏览器打开 http://localhost:8787
-```
-
-本地模式使用内存 KV，进程退出即丢失数据，仅用于验证。
-
-## 测试
-
-```bash
-node --test tests/*.test.mjs
-```
-
-45 项测试覆盖核心逻辑、独立检测、配置变更、告警开关、多状态码/关键字/自定义请求/重试/错误分类、事件历史与 24h 可用率、截图风格 UI（含真实执行前端脚本的 DOM 渲染测试）与安全边界。所有外部依赖通过 `env` 注入，离线可跑。
+- 目标独立检测：每个监控项独立调度、独立历史、独立告警状态机
+- 多线路：Cloudflare 边缘（国外）+ 自托管探针（国内），判定规则两端一致
+- 检测维度（参考 UptimeFlare）：多状态码、关键字正反匹配、自定义请求、瞬时故障重试、稳定错误分类
+- 状态页：统计摘要 + 分组卡片 + 状态条 + 延迟折线图，24h/7d/全部区间切换，浅色/深色主题
+- 告警：Webhook（HMAC 签名）+ 邮件（Resend），含恢复通知、失败阈值、冷却去重；仅送达成功才写冷却标记，失败自动重试
+- 安全：仅探针回传保留令牌、SSRF 防护（含 IPv6 隧道地址）、严格 CSP、零 `innerHTML` 用户渲染、写接口一律 405
 
 ## API 摘要（只读）
 
@@ -116,21 +74,17 @@ node --test tests/*.test.mjs
 | GET | `/api/probes/tasks?probeId=` | Probe | 探针领取任务 |
 | POST | `/api/ingest` | Probe | 探针回传结果（不可改配置） |
 
-**已移除**：`POST/PUT/DELETE /api/monitors`、`POST /api/check`、历史查询接口等一切配置写操作，统一返回 `405`。生产环境不再需要 `ADMIN_TOKEN`。
+## 部署
 
-## 安全说明
+1. Cloudflare Dashboard 创建 Worker，粘贴 `workers.js` 全部内容，绑定 KV（变量名 `KV`）与 Cron `* * * * *`。
+2. 在 Variables 中以 plain_text 添加告警变量（见上表）。
+3. 点击 Deploy 即可；此后增删监控地址直接在编辑器修改 `MONITORS` 数组再 Deploy。
 
-- 配置写入能力整体移除：公开页面无增删改入口，写接口一律 405。
-- 探针回传仅接受当前配置中存在的监控项 ID，已移除的目标不再接收数据。
-- 监控 URL 与 Webhook URL 均经过 SSRF 校验：仅 http(s)、拒绝凭据、拒绝混淆 IP 与内网域名、DNS 解析后拒绝私网地址、禁止跟随重定向。
-- 告警签名使用归一化错误类别而非原始文本，避免文案波动引发告警风暴。
-- 前端使用 DOM API + `textContent` 渲染，严格 CSP，无 `innerHTML` 拼接。
-- 详细结果见 `docs/SECURITY-TEST-REPORT.md`。
+注意：若使用 `wrangler deploy` 命令行部署，必须带 `--keep-vars`，否则会清空 Dashboard 变量。
 
 ## 已知边界
 
-- Cloudflare Workers 无法从中国大陆出口发起请求，国内线路必须由自托管探针实现。
-- Workers 的 `fetch` 无法做原始 TCP/端口探测；`service` 类型指 HTTP 健康检查端点。
-- 修改 `src/config.mjs` 需要重新部署；告警变量修改在新隔离实例生效，可能有数十秒滚动窗口。
-- DNS 校验与实际连接之间存在极短 TOCTOU 时间窗，Workers 环境无法完全消除；已通过"不跟随重定向 + 禁止 IP 字面量 + 解析后校验"降低风险。
-- 告警送达依赖第三方服务（Resend / 用户 Webhook），工具保证按策略触发与发送，不保证最终投递。
+- Cloudflare Workers 无法从中国大陆出口发起请求，国内线路需自托管探针。
+- Workers 的 `fetch` 只能做 HTTP(S) 请求，`service` 类型指 HTTP 健康检查端点，非端口探测。
+- DNS 校验与实际连接之间存在极短 TOCTOU 时间窗；已通过"不跟随重定向 + 禁止 IP 字面量 + 解析后校验"降低风险。
+- 告警送达依赖第三方服务，工具保证按策略触发与发送，不保证最终投递。
