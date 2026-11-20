@@ -47,7 +47,7 @@
 export const MONITORS = [
   {
     id: 'tv',
-    name: 'Home TV',
+    name: 'TV',
     url: 'https://tv.588816.xyz/',
     type: 'website',
     group: 'Public',
