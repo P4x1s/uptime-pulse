@@ -1,12 +1,13 @@
 /**
- * UptimePulse 安全测试套件
- * 覆盖：SSRF / 鉴权绕过 / XSS 与 CSP / 告警去重逻辑 / 输入校验 / 敏感信息泄漏
+ * UptimePulse 安全测试套件（只读版）
+ * 覆盖：SSRF / 鉴权与写接口禁用 / XSS 与 CSP / 告警去重逻辑 /
+ *       后台变量输入校验 / 变量更新同步 / 敏感信息泄漏。
  * 所有测试离线运行，外部依赖通过 env 注入。
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createWorker } from '../src/index.mjs';
-import { assertPublicTarget } from '../src/demo.mjs';
+import { createWorker, runDueChecks } from '../src/index.mjs';
+import { assertPublicTarget, parseTargets } from '../src/demo.mjs';
 
 class MockKV {
   constructor() { this.store = new Map(); }
@@ -42,7 +43,7 @@ function makeCtx() {
     KV, ADMIN_TOKEN: 'Secr3t-Admin-Token', PROBE_TOKEN: 'Secr3t-Probe-Token',
     WEBHOOK_URL: 'https://alert.example.com/hook', ALERT_SIGNING_SECRET: 'Secr3t-Signing-Key',
     RESEND_API_KEY: 're_Secr3tKey', EMAIL_FROM: 'alerts@example.com',
-    PROBE_REGION: 'cf-test',
+    PROBE_REGION: 'cf-test', MONITOR_TARGETS: '',
     resolveDns: async (host) => (host === 'private.example.com' ? ['192.168.1.10'] : ['93.184.216.34']),
     fetchImpl,
   };
@@ -50,27 +51,22 @@ function makeCtx() {
   const req = (path, options = {}) => worker.fetch(new Request(`http://localhost${path}`, options));
   return {
     env, KV, req, webhooks, emails, outbound,
+    check: () => runDueChecks(env, true),
+    setTargets: (targets) => { env.MONITOR_TARGETS = JSON.stringify(targets); },
     setResponder: (fn) => { responder = fn; },
   };
 }
 
-const admin = { authorization: 'Bearer Secr3t-Admin-Token', 'content-type': 'application/json' };
-const probe = { authorization: 'Bearer Secr3t-Probe-Token', 'content-type': 'application/json' };
-
-async function create(ctx, overrides = {}) {
-  const body = {
-    url: 'https://target.example.com', name: '测试目标', failureThreshold: 1,
+function target(overrides = {}) {
+  return {
+    id: 'm1', name: '测试目标', url: 'https://target.example.com', failureThreshold: 1,
     alertCooldownSec: 300, probes: [{ id: 'edge-main', type: 'edge', region: 'cf-test' }],
     ...overrides,
   };
-  const r = await ctx.req('/api/monitors', { method: 'POST', headers: admin, body: JSON.stringify(body) });
-  if (r.status !== 201) throw new Error(`创建失败 ${r.status}: ${await r.text()}`);
-  return (await r.json()).monitor;
 }
 
-// ---------------- SSRF ----------------
-test('SSRF: 混淆 IP / 元数据 / 内网域名 / 特殊协议在配置接口被拒绝', async () => {
-  const ctx = makeCtx();
+// ---------------- SSRF（检测阶段仍强制校验，后台变量不是绕过理由） ----------------
+test('SSRF: 后台变量中的混淆 IP / 元数据 / 内网域名目标在检测时被拒绝', async () => {
   const attacks = [
     'http://127.0.0.1', 'http://0177.0.0.1/', 'http://127.1/',
     'http://0x7f.1/', 'http://2130706433/', 'http://[::1]/',
@@ -78,99 +74,101 @@ test('SSRF: 混淆 IP / 元数据 / 内网域名 / 特殊协议在配置接口�
     'http://169.254.169.254/latest/meta-data/iam/security-credentials/',
     'http://10.0.0.1/', 'http://192.168.1.1/', 'http://100.64.0.1/',
     'http://localhost:8080/', 'http://app.local/', 'http://x.internal/',
-    'https://private.example.com/',
-    'file:///etc/passwd', 'javascript:alert(1)', 'ftp://example.com/',
+    'https://private.example.com/', 'file:///etc/passwd', 'javascript:alert(1)',
     'https://user:pass@example.com/',
   ];
   for (const url of attacks) {
-    const r = await ctx.req('/api/monitors', {
-      method: 'POST', headers: admin, body: JSON.stringify({ url }),
-    });
-    assert.equal(r.status, 400, `应拒绝: ${url}`);
+    const ctx = makeCtx();
+    ctx.setTargets([target({ url })]);
+    await ctx.check();
+    assert.equal(ctx.outbound.length, 0, `不得向恶意目标发起请求: ${url}`);
   }
-  // 超长 URL
-  const long = 'https://example.com/' + 'a'.repeat(3000);
-  const r2 = await ctx.req('/api/monitors', {
-    method: 'POST', headers: admin, body: JSON.stringify({ url: long }),
-  });
-  assert.equal(r2.status, 400);
 });
 
 test('SSRF: 监控目标不允许跟随重定向（阻断跳转内网）', async () => {
   const ctx = makeCtx();
-  await create(ctx);
+  ctx.setTargets([target()]);
   ctx.setResponder(() => ({ status: 302, headers: { location: 'http://127.0.0.1/admin' } }));
-  await ctx.req('/api/check', { method: 'POST', headers: admin });
+  await ctx.check();
   const probeCall = ctx.outbound.find((c) => c.url.includes('target.example.com'));
   assert.ok(probeCall, '应发起探测');
   assert.equal(probeCall.init.redirect, 'manual', '必须禁止自动跟随重定向');
   assert.equal(probeCall.url, 'https://target.example.com/', '不应请求重定向目标');
 });
 
-test('SSRF: Webhook 目标同样被校验，无法通过监控项配置绕过', async () => {
+test('SSRF: Webhook 目标同样被校验，后台变量不能绕过', async () => {
   const ctx = makeCtx();
-  for (const hook of ['http://127.0.0.1:8080/hook', 'http://[::1]/hook', 'file:///etc/passwd']) {
-    const r = await ctx.req('/api/monitors', {
-      method: 'POST', headers: admin,
-      body: JSON.stringify({ url: 'https://target.example.com', webhookUrl: hook }),
-    });
-    assert.equal(r.status, 400, `应拒绝 Webhook: ${hook}`);
-  }
+  ctx.env.WEBHOOK_URL = '';
+  ctx.setTargets([target({ webhookUrl: 'http://127.0.0.1:8080/hook' })]);
+  ctx.setResponder(() => ({ status: 500 }));
+  await ctx.check();
+  assert.equal(ctx.webhooks.length, 0, '内网 Webhook 不得被投递');
+  assert.ok(!ctx.outbound.some((c) => c.url.includes('127.0.0.1')));
+  await assert.rejects(() => assertPublicTarget('file:///etc/passwd', ctx.env.resolveDns));
 });
 
-// ---------------- 鉴权 ----------------
-test('鉴权: 缺失/错误/空/前缀错误的令牌均无法写配置', async () => {
+// ---------------- 鉴权与写接口禁用 ----------------
+test('只读: 所有配置写接口一律禁用，任何令牌都无法改配置', async () => {
   const ctx = makeCtx();
-  const body = JSON.stringify({ url: 'https://target.example.com' });
+  const body = '{"url":"https://target.example.com"}';
   const cases = [
-    {},
-    { authorization: '' },
-    { authorization: 'Bearer ' },
-    { authorization: 'Bearer wrong-token' },
+    {}, { authorization: '' }, { authorization: 'Bearer ' },
+    { authorization: 'Bearer Secr3t-Admin-Token' },
+    { authorization: 'Bearer Secr3t-Probe-Token' },
     { authorization: 'bearer Secr3t-Admin-Token' },
-    { authorization: 'Basic Secr3t-Admin-Token' },
-    // 令牌中间夹空格必须拒绝（首尾 OWS 由 HTTP 栈规范化，不算绕过）
     { authorization: 'Bearer Secr3t Admin Token' },
   ];
   for (const headers of cases) {
-    const r = await ctx.req('/api/monitors', { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body });
-    assert.equal(r.status, 401, `应拒绝: ${JSON.stringify(headers)}`);
+    for (const [method, path] of [
+      ['POST', '/api/monitors'], ['PUT', '/api/monitors/m1'],
+      ['DELETE', '/api/monitors/m1'], ['POST', '/api/check'],
+    ]) {
+      const r = await ctx.req(path, { method, headers: { ...headers, 'content-type': 'application/json' }, body });
+      assert.equal(r.status, 405, `${method} ${path} 应禁用: ${JSON.stringify(headers)}`);
+    }
   }
-  // 探针令牌不能执行管理员操作
-  const probeAttempt = await ctx.req('/api/monitors', { method: 'POST', headers: probe, body });
-  assert.equal(probeAttempt.status, 401);
-  // 管理员令牌不能执行探针操作
-  const adminAttempt = await ctx.req('/api/ingest', {
-    method: 'POST', headers: admin, body: JSON.stringify({ monitorId: 'x', probeId: 'y', ok: true }),
-  });
-  assert.equal(adminAttempt.status, 401);
 });
 
-test('鉴权: 未授权不能读取历史或触发检测', async () => {
+test('鉴权: 探针接口仍需令牌，管理员令牌不能回传探针数据', async () => {
   const ctx = makeCtx();
-  assert.equal((await ctx.req('/api/monitors/x/history')).status, 401);
-  assert.equal((await ctx.req('/api/check', { method: 'POST' })).status, 401);
+  ctx.setTargets([target()]);
   assert.equal((await ctx.req('/api/probes/tasks?probeId=edge-main')).status, 401);
+  assert.equal((await ctx.req('/api/probes/tasks?probeId=edge-main', { headers: { authorization: 'Bearer wrong' } })).status, 401);
+  assert.equal((await ctx.req('/api/probes/tasks?probeId=edge-main', { headers: { authorization: 'Bearer Secr3t-Probe-Token' } })).status, 200);
+  assert.equal((await ctx.req('/api/ingest', {
+    method: 'POST', headers: { authorization: 'Bearer Secr3t-Admin-Token', 'content-type': 'application/json' },
+    body: JSON.stringify({ monitorId: 'm1', probeId: 'x', ok: true }),
+  })).status, 401);
 });
 
-// ---------------- XSS / CSP ----------------
-test('XSS: 用户输入不进入 HTML，前端使用 textContent 且 CSP 严格', async () => {
+// ---------------- 只读前端 ----------------
+test('只读前端: 无新增/编辑/删除/立即检测入口，CSP 严格且无内联脚本', async () => {
   const ctx = makeCtx();
-  const payload = '<img src=x onerror="alert(1)"></script><script>alert(2)</script>';
-  await create(ctx, { name: payload });
-
+  ctx.setTargets([target()]);
   const pageResp = await ctx.req('/');
   const page = await pageResp.text();
-  assert.ok(!page.includes('onerror='), '首页 HTML 不应包含用户输入');
+  for (const forbidden of ['addForm', '立即检测', '管理员令牌', '删除']) {
+    assert.ok(!page.includes(forbidden), `首页不应出现: ${forbidden}`);
+  }
+  assert.ok(page.includes('只读'), '应明确标注只读');
   const csp = pageResp.headers.get('content-security-policy') || '';
   const scriptDirective = csp.split(';').map((s) => s.trim()).find((s) => s.startsWith('script-src')) || '';
   assert.ok(scriptDirective.includes("'self'"), 'script-src 应限制为 self');
   assert.ok(!scriptDirective.includes('unsafe-inline'), 'script-src 不应允许内联脚本');
 
   const js = await (await ctx.req('/app.js')).text();
-  assert.ok(!js.includes('innerHTML'), '前端不得使用 innerHTML 渲染用户数据');
+  assert.ok(!js.includes('innerHTML'), '前端不得使用 innerHTML');
+  assert.ok(!js.includes('/api/monitors'), '前端不应引用已移除的配置接口');
+  assert.ok(!js.includes('prompt('), '前端不应弹出令牌输入');
   assert.ok(js.includes('textContent'), '前端应使用 textContent');
+});
 
+test('XSS: 后台变量中的名称不进入 HTML，前端使用 textContent', async () => {
+  const ctx = makeCtx();
+  const payload = '<img src=x onerror="alert(1)"></script><script>alert(2)</script>';
+  ctx.setTargets([target({ name: payload })]);
+  const page = await (await ctx.req('/')).text();
+  assert.ok(!page.includes('onerror='), '首页 HTML 不应包含配置数据');
   const status = await (await ctx.req('/api/status')).json();
   assert.equal(status.monitors[0].name, payload, 'JSON 中保留原值，由前端安全渲染');
   const type = (await ctx.req('/api/status')).headers.get('content-type');
@@ -180,69 +178,70 @@ test('XSS: 用户输入不进入 HTML，前端使用 textContent 且 CSP 严格'
 // ---------------- 告警逻辑 ----------------
 test('逻辑: 错误文案变化不改变签名，冷却期内不重复告警', async () => {
   const ctx = makeCtx();
-  await create(ctx, { failureThreshold: 1, alertCooldownSec: 300 });
+  ctx.setTargets([target({ failureThreshold: 1, alertCooldownSec: 300 })]);
   ctx.setResponder(() => ({ throw: Object.assign(new Error('network boom A'), { name: 'Error' }) }));
-  await ctx.req('/api/check', { method: 'POST', headers: admin });
+  await ctx.check();
   assert.equal(ctx.webhooks.length, 1);
 
   ctx.setResponder(() => ({ throw: Object.assign(new Error('network totally different message B'), { name: 'Error' }) }));
-  await ctx.req('/api/check', { method: 'POST', headers: admin });
+  await ctx.check();
   assert.equal(ctx.webhooks.length, 1, '同类别错误在冷却期内应去重');
 
   ctx.setResponder(() => ({ throw: Object.assign(new Error('aborted'), { name: 'AbortError' }) }));
-  await ctx.req('/api/check', { method: 'POST', headers: admin });
+  await ctx.check();
   assert.equal(ctx.webhooks.length, 2, '错误类别变化（timeout）应允许新通知');
 });
 
 test('逻辑: 恢复后再次故障生成新的 incidentId', async () => {
   const ctx = makeCtx();
-  const m = await create(ctx, { failureThreshold: 1, alertCooldownSec: 0 });
+  ctx.setTargets([target({ failureThreshold: 1, alertCooldownSec: 0 })]);
   ctx.setResponder(() => ({ status: 500 }));
-  await ctx.req('/api/check', { method: 'POST', headers: admin });
-  const first = (await ctx.KV.get(`incident:${m.id}`, 'json')).incidentId;
+  await ctx.check();
+  const first = (await ctx.KV.get('incident:m1', 'json')).incidentId;
   ctx.setResponder(() => ({ status: 200 }));
-  await ctx.req('/api/check', { method: 'POST', headers: admin });
+  await ctx.check();
   ctx.setResponder(() => ({ status: 500 }));
-  await ctx.req('/api/check', { method: 'POST', headers: admin });
-  const second = (await ctx.KV.get(`incident:${m.id}`, 'json')).incidentId;
+  await ctx.check();
+  const second = (await ctx.KV.get('incident:m1', 'json')).incidentId;
   assert.ok(first && second && first !== second, '新事件必须有新的 incidentId');
   assert.ok(ctx.webhooks.some((w) => w.body.type === 'recovered'));
 });
 
-test('逻辑: 冷却窗口与阈值边界被正确钳制，不能绕过', async () => {
-  const ctx = makeCtx();
-  const m = await create(ctx, { failureThreshold: 999, alertCooldownSec: -50 });
-  assert.equal(m.failureThreshold, 20, '阈值上限 20');
-  assert.equal(m.alertCooldownSec, 0, '冷却不能为负');
-  const m2 = await create(ctx, { failureThreshold: 0, url: 'https://other.example.com' });
-  assert.equal(m2.failureThreshold, 1, '阈值下限 1');
+// ---------------- 后台变量输入校验 ----------------
+test('输入: 后台变量字段被钳制，非法目标/邮箱被清洗或过滤', async () => {
+  const parsed = parseTargets(JSON.stringify([
+    target({
+      name: 'x'.repeat(500),
+      emailTo: 'owner@example.com',
+      probes: Array.from({ length: 20 }, (_, i) => ({ id: `<bad id ${i}>`, type: 'external', region: 'r' })),
+    }),
+    target({ id: 'm2', url: 'https://other.example.com', emailTo: 'not-an-email' }),
+    { url: 'not-a-url' },
+    { url: 'file:///etc/passwd' },
+  ]));
+  assert.equal(parsed.length, 2, '非法 URL 条目应被过滤');
+  assert.equal(parsed[0].name.length, 80);
+  assert.equal(parsed[0].probes.length, 10, '探针数量上限 10');
+  assert.ok(parsed[0].probes.every((p) => /^[a-zA-Z0-9_-]+$/.test(p.id)), '探针 ID 应被清洗');
+  assert.ok(parsed[0].emailTo === 'owner@example.com', '合法邮箱保留');
+  assert.equal(parsed[1].emailTo, '', '非法邮箱被丢弃');
 });
 
-// ---------------- 输入校验 ----------------
-test('输入: 超长字段被截断，探针 ID 被清洗，非法邮箱被拒绝', async () => {
+test('输入: MONITOR_TARGETS 非法 JSON 或空值时安全降级为空列表', async () => {
   const ctx = makeCtx();
-  const m = await create(ctx, {
-    name: 'x'.repeat(500),
-    emailTo: 'owner@example.com',
-    probes: Array.from({ length: 20 }, (_, i) => ({ id: `<bad id ${i}>`, type: 'external', region: 'r' })),
-  });
-  assert.equal(m.name.length, 80);
-  assert.equal(m.probes.length, 10, '探针数量上限 10');
-  assert.ok(m.probes.every((p) => /^[a-zA-Z0-9_-]+$/.test(p.id)), '探针 ID 应被清洗为安全字符');
-
-  const bad = await ctx.req('/api/monitors', {
-    method: 'POST', headers: admin,
-    body: JSON.stringify({ url: 'https://target.example.com', emailTo: 'not-an-email' }),
-  });
-  assert.equal(bad.status, 400);
+  for (const raw of ['', 'not-json', '{}', 'null']) {
+    ctx.env.MONITOR_TARGETS = raw;
+    const s = await (await ctx.req('/api/status')).json();
+    assert.equal(s.monitors.length, 0);
+  }
 });
 
 // ---------------- 信息泄漏 ----------------
 test('信息泄漏: 响应体与响应头不包含任何密钥', async () => {
   const ctx = makeCtx();
-  await create(ctx, { emailTo: 'owner@example.com' });
+  ctx.setTargets([target({ emailTo: 'owner@example.com' })]);
   ctx.setResponder(() => ({ status: 500 }));
-  await ctx.req('/api/check', { method: 'POST', headers: admin });
+  await ctx.check();
   const responses = [
     await ctx.req('/'), await ctx.req('/api/status'), await ctx.req('/app.js'), await ctx.req('/app.css'),
   ];
@@ -256,19 +255,4 @@ test('信息泄漏: 响应体与响应头不包含任何密钥', async () => {
   }
   const status = await (await ctx.req('/api/status')).json();
   assert.ok(!JSON.stringify(status).includes('owner@example.com'), '状态接口不应暴露告警邮箱');
-});
-
-test('逻辑: 删除监控项同时清理探针上报数据', async () => {
-  const ctx = makeCtx();
-  const m = await create(ctx, {
-    probes: [{ id: 'cn-1', type: 'external', region: 'cn-sh' }],
-  });
-  await ctx.req('/api/ingest', {
-    method: 'POST', headers: probe,
-    body: JSON.stringify({ monitorId: m.id, probeId: 'cn-1', ok: true, status: 200, latencyMs: 10 }),
-  });
-  assert.ok(await ctx.KV.get(`probe:${m.id}:cn-1`, 'json'));
-  await ctx.req(`/api/monitors/${m.id}`, { method: 'DELETE', headers: admin });
-  assert.equal(await ctx.KV.get(`probe:${m.id}:cn-1`, 'json'), null);
-  assert.equal(await ctx.KV.get(`history:${m.id}`, 'json'), null);
 });

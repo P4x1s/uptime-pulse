@@ -1,8 +1,12 @@
 # 本地开发变量示例（复制为 .dev.vars 并填入真实值，切勿提交）
-ADMIN_TOKEN=change-me-admin
+# 注意：只读版已移除 ADMIN_TOKEN，配置写接口全部禁用
 PROBE_TOKEN=change-me-probe
 ALERT_SIGNING_SECRET=change-me-signing
 WEBHOOK_URL=https://your-domain.example.com/hook
 PROBE_REGION=cf-edge
 RESEND_API_KEY=
 EMAIL_FROM=
+
+# 监控目标统一通过后台变量配置（JSON 数组或 {"targets":[...]}）
+# 服务端读取后生成监控列表；变量更新后新隔离实例会立即按新配置检测与展示
+MONITOR_TARGETS=[{"id":"site-a","name":"示例站点","url":"https://example.com","failureThreshold":3,"probes":[{"id":"edge-main","type":"edge","region":"cf-edge"}]}]

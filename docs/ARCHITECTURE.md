@@ -2,7 +2,9 @@
 
 ## 1. 目标与边界
 
-轻量网站可用性监控，源码可托管 GitHub，运行时部署在 Cloudflare Workers。配置自定义监控项，从国内外多线路定期检测，覆盖 HTTP 状态、响应时间、超时、连续失败；展示实时状态、历史可用率、异常记录；按配置推送邮件 / Webhook 告警，含恢复通知、失败阈值、告警去重。
+轻量网站可用性监控，源码可托管 GitHub，运行时部署在 Cloudflare Workers。监控目标由管理员通过 Cloudflare 后台变量 `MONITOR_TARGETS` 配置，服务端读取生成监控列表；从国内外多线路定期检测，覆盖 HTTP 状态、响应时间、超时、连续失败；前端只读展示实时状态、历史可用率、异常记录；按配置推送邮件 / Webhook 告警，含恢复通知、失败阈值、告警去重。
+
+**只读原则**：公开页面与 API 不含任何配置写能力，任何访问者都无法新增/编辑/删除监控项；配置只在 Cloudflare 后台修改。
 
 明确边界：
 
@@ -13,18 +15,21 @@
 ## 2. 总体架构
 
 ```
+  管理员 ──后台变量──▶ MONITOR_TARGETS (JSON)
+                              │ 服务端读取生成监控列表
+                              ▼
                     ┌──────────────────────────────┐
    浏览器 ──HTTPS──▶│  Cloudflare Worker (入口)     │
-                    │  · 极简 Dashboard (内联 HTML) │
-                    │  · 配置 API (Bearer 鉴权)     │
+                    │  · 只读 Dashboard             │
+                    │  · 只读 /api/status           │
                     │  · Cron 调度器                │
                     └───────┬──────────────┬────────┘
                             │              │
               ┌─────────────▼──┐    ┌──────▼────────────┐
               │ KV 存储         │    │ 检测引擎           │
-              │ · monitor:<id>  │    │ · SSRF 校验        │
-              │ · history:<id>  │    │ · fetch + 计时     │
-              │ · incident:<id> │    │ · 状态/超时判定    │
+              │ · history:<id>  │    │ · SSRF 校验        │
+              │ · incident:<id> │    │ · fetch + 计时     │
+              │ · probe:<id>    │    │ · 状态/超时判定    │
               └────────────────┘    └──────┬────────────┘
                                            │
                     ┌──────────────────────┼──────────────────┐
@@ -44,22 +49,24 @@
 - **国内线路**：`scripts/probe-cn` 提供无第三方依赖的 Node 探针，部署在大陆 VPS / 云函数。它调用受保护的 `/api/ingest` 上报结果，使用独立 `PROBE_TOKEN`，不暴露配置写权限。
 - **聚合规则**：每个监控项可启用多个探针。一次"检查轮次"汇总所有已上报探针结果，按多数 / 任一成功策略（可配 `aggregate`，默认 `any`）判定整体可用性；每个探针的连续失败独立计数，避免单线路故障误判。
 
-## 4. 数据模型（KV）
+## 4. 配置与数据模型
+
+**配置源（唯一）：`MONITOR_TARGETS` 后台变量**（不在 KV、不通过 API 写入）。值为 JSON 数组或 `{"targets":[...]}`，服务端 `parseTargets()` 规范化为监控列表；`id` 省略时由 URL + 名称稳定派生，保证变量更新后历史连续。按变量原始字符串缓存解析结果，变化即失效重解析（同步生效）。
 
 | Key | 值 | 说明 |
 |---|---|---|
-| `monitor:<id>` | Monitor 对象 | 监控项配置 |
-| `monitor:index` | string[] | 监控项 id 列表 |
 | `history:<id>` | CheckRecord[] | 最近 N 条检查记录（默认 500，环形覆盖） |
 | `incident:<id>` | IncidentState | 告警状态机（连续失败数、事件 id、最近告警时间） |
+| `probe:<id>:<probeId>` | ProbeResult | 外部探针最近一次上报 |
+| `lastrun:<id>` | number | 上次检测时间戳，用于间隔判定 |
 
-Monitor 关键字段：`id, name, url, method, expectedStatus, timeoutMs, intervalSec, failureThreshold, probes[], aggregate, alertChannels[], webhookUrl, emailTo, enabled`。
+Monitor 关键字段：`id, name, url, method, expectedStatus, timeoutMs, intervalSec, failureThreshold, probe[], aggregate, webhookUrl, emailTo, enabled`。
 
 IncidentState 关键字段：`consecutiveFailures, state(ok/warning/firing), incidentId, lastAlertAt, lastNotifiedStatus, lastErrorSignature`。
 
 ## 5. 检测与判定
 
-1. Cron 每分钟触发；遍历 `monitor:index`，按 `intervalSec` 与 `lastRunAt` 判断是否到期。
+1. Cron 每分钟触发；从 `MONITOR_TARGETS` 生成监控列表，按 `intervalSec` 与 `lastrun:<id>` 判断是否到期。
 2. 对到期项执行 SSRF 校验 → `fetch`（`redirect: 'manual'`，记录重定向但不自动跳转）→ 计时 → 记录 status / latency / error。
 3. 判定：超时、`status` 不在期望集合、网络错误均为失败；连续失败数达 `failureThreshold` 才进入 firing。
 4. 恢复：任一探针成功且此前 firing → 发送恢复通知，重置计数。
@@ -78,15 +85,17 @@ IncidentState 关键字段：`consecutiveFailures, state(ok/warning/firing), inc
 
 | 威胁 | 措施 |
 |---|---|
-| 配置接口未授权访问 | Bearer `ADMIN_TOKEN` + 常量时间比较；所有写操作与 ingest 分离鉴权 |
-| SSRF（监控 URL / Webhook） | 仅 http(s)；拒绝 IP 字面量、localhost、内网域名后缀、元数据地址；DoH 解析后拒绝私网 IP；禁止跟随重定向 |
-| XSS | 前端仅用 `textContent` / DOM API 渲染用户数据，零 `innerHTML` 拼接；CSP 限制脚本来源 |
+| 公开访问者篡改监控配置 | 配置写接口整体移除（一律 405）；前端无增删改入口；配置只在后台变量维护 |
+| 探针越权 | 仅 `/api/probes/tasks` 与 `/api/ingest` 保留 `PROBE_TOKEN` 鉴权；ingest 只接受当前变量中存在的监控项 ID |
+| SSRF（监控 URL / Webhook） | 仅 http(s)；拒绝 IP 字面量、localhost、内网域名后缀、元数据地址；DoH 解析后拒绝私网 IP；禁止跟随重定向（后台变量同样校验） |
+| XSS | 前端仅用 `textContent` / DOM API 渲染配置数据，零 `innerHTML` 拼接；严格 CSP 禁止内联脚本 |
 | 告警签名伪造 | HMAC-SHA256，接收方可验签 |
-| 敏感信息泄漏 | 密钥仅存 Worker Secret；前端不返回任何密钥；错误响应不回显请求体 |
-| 逻辑漏洞（重复告警） | 状态机 + incidentId + 冷却窗口，单测覆盖 |
+| 敏感信息泄漏 | 密钥仅存 Worker Secret；前端与状态接口不返回任何密钥或告警邮箱 |
+| 逻辑漏洞（重复告警） | 状态机 + incidentId + 冷却窗口 + 错误类别归一化，单测覆盖 |
 
 ## 8. 交付阶段
 
-- **阶段 A（demo）**：单文件 Worker，配置 CRUD + 检测 + Webhook 告警 + 极简页面，本地 dev server 跑通核心链路。
-- **阶段 B（功能丰富）**：模块化、邮件通道、国内探针、统计与异常记录、完整鉴权、GitHub Actions、文档。
+- **阶段 A（demo）**：单文件 Worker，检测 + Webhook 告警 + 极简页面，本地 dev server 跑通核心链路。
+- **阶段 B（功能丰富）**：模块化、邮件通道、国内探针、统计与异常记录、GitHub Actions、文档。
 - **阶段 C（安全测试）**：自动化用例覆盖 SSRF / XSS / 鉴权 / 逻辑漏洞，输出报告并修复。
+- **阶段 D（只读改造）**：配置收敛到后台变量 `MONITOR_TARGETS`，移除全部配置写接口与前端增删改入口，保留只读展示与告警核心。

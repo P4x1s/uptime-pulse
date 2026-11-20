@@ -42,6 +42,8 @@ const env = {
   RESEND_API_KEY: process.env.RESEND_API_KEY || '',
   EMAIL_FROM: process.env.EMAIL_FROM || '',
   PROBE_TOKEN: process.env.PROBE_TOKEN || 'demo-probe-token',
+  // 监控目标统一由后台变量提供（本地可用 MONITOR_TARGETS 环境变量注入）
+  MONITOR_TARGETS: process.env.MONITOR_TARGETS || '',
   resolveDns,
   fetchImpl: (...args) => fetch(...args),
 };
@@ -78,5 +80,5 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(port, () => {
   console.log(`UptimePulse dev server (${workerPath}) → http://localhost:${port}`);
-  console.log(`ADMIN_TOKEN=${env.ADMIN_TOKEN}  PROBE_REGION=${env.PROBE_REGION}`);
+  console.log(`只读模式：监控目标来自后台变量 MONITOR_TARGETS（当前 ${env.MONITOR_TARGETS ? '已配置' : '为空'}）`);
 });

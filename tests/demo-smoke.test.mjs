@@ -1,6 +1,6 @@
 /**
- * Demo 阶段核心链路测试：SSRF / 检测判定 / 失败阈值 / 告警去重 / 恢复通知 / 可用率。
- * 全部依赖通过 env 注入，不依赖外网。
+ * Demo 核心链路测试（只读版）：SSRF / 检测判定 / 失败阈值 / 告警去重 / 恢复通知 / 可用率。
+ * 监控目标由后台变量提供，全部依赖通过 env 注入，不依赖外网。
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -36,13 +36,14 @@ function makeEnv(overrides = {}) {
   };
   const resolveDns = async (host) => (host === 'dns-private.example.com' ? ['10.0.0.5'] : ['93.184.216.34']);
   const env = {
-    KV, ADMIN_TOKEN: 'test-token', PROBE_REGION: 'test-line',
+    KV, ADMIN_TOKEN: 'test-token', PROBE_REGION: 'test-line', MONITOR_TARGETS: '',
     WEBHOOK_URL: 'https://alert.example.com/hook', ALERT_SIGNING_SECRET: 'test-secret',
     resolveDns, fetchImpl,
   };
   return {
     env, KV, alerts, calls,
     setResponder: (fn) => { responder = fn; },
+    setTargets: (targets) => { env.MONITOR_TARGETS = JSON.stringify(targets); },
     ...overrides,
   };
 }
@@ -128,12 +129,10 @@ test('告警状态机: 阈值触发 / 同签名去重 / 恢复通知 / 签名可
   assert.equal(state.consecutiveFailures, 0);
 });
 
-test('可用率与异常记录: 状态接口按历史计算', async () => {
+test('可用率与异常记录: 状态接口按后台变量目标的历史计算', async () => {
   const ctx = makeEnv();
   const m = makeMonitor();
-  const kv = ctx.env.KV;
-  await kv.put('monitor:index', JSON.stringify(['m1']));
-  await kv.put('monitor:m1', JSON.stringify(m));
+  ctx.setTargets([m]);
   ctx.setResponder(() => ({ status: 200 }));
   await runCheck(ctx.env, m);
   ctx.setResponder(() => ({ status: 500 }));
