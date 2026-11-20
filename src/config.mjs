@@ -42,13 +42,16 @@
  *
  * 注意：Cloudflare Workers 的 fetch 只能做 HTTP(S) 请求，无法发起原始 TCP/端口探测。
  *       "service" 类型指通过 HTTP 健康检查端点监控服务，不是端口连通性探测。
+ *
+ * 【脱敏说明】本仓库版本中的监控地址已全部替换为 example.com 示例域（如 tv.example.com）。
+ *   实际部署时请将 url / statusPageLink 换回你自己的真实地址；换地址不影响其它逻辑。
  */
 
 export const MONITORS = [
   {
     id: 'tv',
     name: 'Home TV',
-    url: 'https://tv.588816.xyz/',
+    url: 'https://tv.example.com/',
     type: 'website',
     group: 'Public',
     enabled: true,
@@ -59,7 +62,7 @@ export const MONITORS = [
     // responseKeyword: '"ok"',            // 响应体必须包含
     // responseForbiddenKeyword: 'error',  // 响应体不得包含
     // method: 'GET', headers: { 'X-Api-Key': '...' }, body: '', retries: 1,
-    // tooltip: '首页健康检查', statusPageLink: 'https://tv.588816.xyz/', hideLatencyChart: false,
+    // tooltip: '首页健康检查', statusPageLink: 'https://tv.example.com/', hideLatencyChart: false,
     timeoutMs: 5000,
     intervalSec: 60,
     failureThreshold: 3,
@@ -69,7 +72,7 @@ export const MONITORS = [
   {
     id: 'car',
     name: 'Car',
-    url: 'https://car.588816.xyz/',
+    url: 'https://car.example.com/',
     type: 'website',
     group: 'Public',
     enabled: true,
@@ -85,7 +88,7 @@ export const MONITORS = [
   {
     id: 'news',
     name: 'News',
-    url: 'https://news.588816.xyz/',
+    url: 'https://news.example.com/',
     type: 'website',
     group: 'Public',
     enabled: true,
@@ -100,7 +103,7 @@ export const MONITORS = [
    {
     id: 'note',
     name: 'Note',
-    url: 'https://note.588816.xyz/',
+    url: 'https://note.example.com/',
     type: 'website',
     group: 'Public',
     enabled: true,
@@ -115,7 +118,7 @@ export const MONITORS = [
   {
     id: 'res',
     name: 'Res',
-    url: 'https://res.588816.xyz/',
+    url: 'https://res.example.com/',
     type: 'website',
     group: 'Public',
     enabled: true,
@@ -130,7 +133,7 @@ export const MONITORS = [
   {
     id: 'notify',
     name: 'Notify',
-    url: 'https://ntfy.588816.xyz/',
+    url: 'https://ntfy.example.com/',
     type: 'website',
     group: 'Public',
     enabled: true,

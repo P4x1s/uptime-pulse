@@ -5,7 +5,7 @@ PROBE_REGION=cf-edge
 
 # 告警地址与开关：真实值请放在 Cloudflare Dashboard，不要写死在代码里
 ALERT_WEBHOOK_ENABLED=false
-ALERT_WEBHOOK_URL=https://ntfy.588816.xyz/<your-token>.send?text=【服务监测】&desp=监测服务出现故障！
+ALERT_WEBHOOK_URL=https://ntfy.example.com/<your-token>.send?text=【服务监测】&desp=监测服务出现故障！
 ALERT_SIGNING_SECRET=change-me-signing
 # 设为 1 = 检测到宕机/无法联通立即推送（推荐）；未设置则沿用监控项 failureThreshold
 ALERT_FAILURE_THRESHOLD=1
