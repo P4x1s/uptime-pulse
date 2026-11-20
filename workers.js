@@ -1120,6 +1120,16 @@ function saveSnapshot(env, snap) {
   return env.KV.put(SNAPSHOT_KEY, JSON.stringify(snap));
 }
 
+/** 一次性清理旧版分散键（incident:/history:/lastrun:）：快照迁移完成后不再使用，删除不计入写入额度 */
+async function cleanupLegacyKeys(env, monitors) {
+  const prefixes = ['incident:', 'history:', 'lastrun:'];
+  for (const m of monitors) {
+    for (const p of prefixes) {
+      try { await env.KV.delete(p + m.id); } catch (e) { /* 删除失败不影响主流程 */ }
+    }
+  }
+}
+
 /** 到期监控项：edge 线路即时探测；external 线路读取最近上报 */
 async function runDueChecks(env, force = false) {
   const monitors = await getMonitors(env);
@@ -1131,6 +1141,13 @@ async function runDueChecks(env, force = false) {
   const due = candidates
     .filter(({ m, intervalMs }) => force || now - (Number(snap.lastrun[m.id]) || 0) >= intervalMs)
     .map(({ m }) => m);
+
+  // 一次性清理旧版分散键：只在 cleanupDone 标记缺失时执行一次
+  if (snap.cleanupDone !== true) {
+    await cleanupLegacyKeys(env, monitors);
+    snap.cleanupDone = true;
+    if (!due.length) { await saveSnapshot(env, snap); return []; }
+  }
   if (!due.length) return [];
 
   const rounds = await Promise.all(due.map(async (m) => {
